@@ -87,14 +87,7 @@ struct ubd_device {
 	struct gendisk		*ub_disk;
 	struct request_queue	*ub_queue;
 
-	/* for map block request into ubdsrv daemon vm */
-	struct mm_struct	*io_buf_mm;
-	struct vm_area_struct	*io_buf_vma;
-
 	struct ubd_queue	*queues;
-
-	void			*zero_page;
-	unsigned		zero_page_size;
 
 	unsigned  bs_shift, max_io_buf_sz;
 	struct ubdsrv_ctrl_dev_info	dev_info;
@@ -128,11 +121,6 @@ static inline bool ubd_rq_need_copy(struct request *rq)
 static inline bool ubd_support_zero_copy(struct ubd_device *ub)
 {
 	return ub->dev_info.flags & (1ULL << UBD_F_SUPPORT_ZERO_COPY);
-}
-
-static inline bool ubd_has_zero_copy(struct ubd_device *ub)
-{
-	return !!ub->io_buf_vma;
 }
 
 static inline struct ubdsrv_io_desc *ubd_get_iod(struct ubd_queue *ubq, int tag)
@@ -189,16 +177,6 @@ static const struct block_device_operations ub_fops = {
 	.release =	ubd_release,
 };
 
-static unsigned long ubd_rq_mappped_addr(struct ubd_device *ub,
-		struct ubd_queue *ubq, int tag)
-{
-	unsigned long start = ub->io_buf_vma->vm_start + ubq->q_id *
-		ubd_queue_io_buf_size(ub);
-
-	return start + tag * ubd_queue_single_io_buf_size(ub);
-}
-
-
 #define UBD_MAX_PIN_PAGES	32
 
 static void ubd_release_pages(struct ubd_device *ub, struct page **pages,
@@ -216,16 +194,6 @@ static int ubd_pin_user_pages(struct ubd_device *ub, u64 start_vm,
 	unsigned int gup_flags = to_rq ? 0 : FOLL_WRITE;
 
 	return get_user_pages_fast(start_vm, nr_pages, gup_flags, pages);
-#if 0
-	struct mm_struct *mm = ub->ub_daemon->mm;
-	unsigned ret, locked = 1;
-	mmap_read_lock(mm);
-	ret = get_user_pages_remote(mm, start_vm, nr_pages,
-			gup_flags, pages, NULL, &locked);
-	if (locked)
-		mmap_read_unlock(mm);
-	return ret;
-#endif
 }
 
 /* todo: need flush cache */
@@ -337,89 +305,15 @@ refill:
 }
 
 #define UBD_REMAP_BATCH	32
-#if 0
-static int ubd_map_io_zero_copy(struct request *req)
-{
-	struct blk_mq_hw_ctx *hctx = req->mq_hctx;
-	struct ubd_device *ub = req->q->queuedata;
-	struct ubd_queue *ubq = hctx->driver_data;
-	struct req_iterator req_iter;
-	struct bio_vec bv;
-	unsigned long start, addr;
-	int ret = -EINVAL;
-	struct ubdsrv_io_desc *iod = ubd_get_iod(ubq, req->tag);
-
-	start = ubd_rq_mappped_addr(ub, ubq, req->tag);
-	addr = start;
-
-	mmap_read_lock(ub->io_buf_mm);
-	rq_for_each_bvec(bv, req, req_iter) {
-		if (bv.bv_offset || !PAGE_ALIGNED(bv.bv_len))
-			goto fail;
-		ret = remap_pfn_range(ub->io_buf_vma, addr,
-				page_to_pfn(bv.bv_page), bv.bv_len,
-				ub->io_buf_vma->vm_page_prot);
-		if (ret)
-			break;
-		addr += bv.bv_len;
-	}
-	mmap_read_unlock(ub->io_buf_mm);
-	if (!ret)
-		iod->addr = start;
- fail:
-	return ret;
-}
-static int ubd_unmap_io_zero_copy(struct request *req)
-{
-	struct blk_mq_hw_ctx *hctx = req->mq_hctx;
-	struct ubd_device *ub = req->q->queuedata;
-	struct ubd_queue *ubq = hctx->driver_data;
-	unsigned long start;
-
-	start = ubd_rq_mappped_addr(ub, ubq, req->tag);
-
-	mmap_read_lock(ub->io_buf_mm);
-	zap_page_range(ub->io_buf_vma, start, req->__data_len);
-	mmap_read_unlock(ub->io_buf_mm);
-}
-#else
-static inline int ubd_map_io_zero_copy(struct request *req)
-{
-	return 0;
-}
-static inline int ubd_unmap_io_zero_copy(struct request *req)
-{
-	return 0;
-}
-#endif
-
-static int ubd_map_io(struct request *req)
-{
-	struct ubd_device *ub = req->q->queuedata;
-
-	if (ubd_has_zero_copy(ub))
-		return ubd_map_io_zero_copy(req);
-
-	/*
-	 * no zero copy, we will delay copy WRITE request data to user buffer
-	 * via by coming GET_DATA command
-	 */
-
-	return 0;
-}
 
 static int ubd_unmap_io(struct request *req)
 {
 	struct ubd_device *ub = req->q->queuedata;
 
 	/* no zero copy, just copy user buffer to request pages for READ */
-	if (!ubd_has_zero_copy(ub)) {
-		if (!op_is_write(req->cmd_flags) && ubd_rq_need_copy(req))
-			return ubd_copy_pages(ub, req);
-		return 0;
-	} else {
-		return ubd_unmap_io_zero_copy(req);
-	}
+	if (!op_is_write(req->cmd_flags) && ubd_rq_need_copy(req))
+		return ubd_copy_pages(ub, req);
+	return 0;
 }
 
 static int ubd_setup_iod(struct ubd_queue *ubq, struct request *req)
@@ -483,10 +377,6 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	/* fill iod to slot in io cmd buffer */
 	res = ubd_setup_iod(ubq, rq);
 	if (res != BLK_STS_OK)
-		return BLK_STS_IOERR;
-
-	/* todo: fallback to copy_[to|from]_user */
-	if (ubd_map_io(bd->rq))
 		return BLK_STS_IOERR;
 
 	blk_mq_start_request(bd->rq);
@@ -579,15 +469,6 @@ static int ubd_ch_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static vm_fault_t ubd_vma_fault(struct vm_fault *vmf)
-{
-	return VM_FAULT_SIGBUS;
-}
-
-static const struct vm_operations_struct ubd_vm_ops = {
-	.fault = ubd_vma_fault,
-};
-
 /* map pre-allocated per-queue cmd buffer to ubdsrv daemon */
 static int ubd_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -602,10 +483,6 @@ static int ubd_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 		if (!ubd_support_zero_copy(ub))
 			return -EINVAL;
 		vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP;
-		ub->io_buf_mm = vma->vm_mm;
-		ub->io_buf_vma = vma;
-		vma->vm_ops = &ubd_vm_ops;
-		vma->vm_private_data = ub;
 #ifdef DEBUG
 	printk("%s: mmaped buf vm addr %lx-%lx\n",
 			__func__, vma->vm_start, vma->vm_end);
@@ -652,9 +529,6 @@ static int ubd_ch_handle_get_data(struct ubd_device *ub,
 		struct ubdsrv_io_cmd *ub_cmd)
 {
 	struct request *req;
-
-	if (ubd_has_zero_copy(ub))
-		return 0;
 
 	req = blk_mq_tag_to_rq(ub->tag_set.tags[ub_cmd->q_id], ub_cmd->tag);
 	if (!req)
@@ -842,8 +716,6 @@ static void ubd_cdev_rel(struct device *dev)
 
 	ubd_deinit_queues(ub);
 
-	free_pages((unsigned long)ub->zero_page,
-			get_order(ub->zero_page_size));
 	kfree(ub);
 }
 
@@ -878,18 +750,6 @@ static int ubd_add_dev(struct ubd_device *ub)
 	struct gendisk *disk;
 	int err = -ENOMEM;
 	int bsize;
-	bool zero_copy = ub->dev_info.flags & (1ULL << UBD_F_SUPPORT_ZERO_COPY);
-
-	if (zero_copy && ub->dev_info.block_size != PAGE_SIZE)
-		return -EINVAL;
-
-	if (zero_copy) {
-		ub->zero_page_size = PAGE_SIZE;
-		ub->zero_page = (void *) __get_free_pages(GFP_KERNEL,
-				get_order(ub->zero_page_size));
-		if (!ub->zero_page)
-			return -ENOMEM;
-	}
 
 	bsize = ub->dev_info.block_size;
 	ub->bs_shift = ilog2(bsize);
