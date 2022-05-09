@@ -1178,7 +1178,7 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 	case UBD_CMD_GET_DEV_INFO:
 		ub = ubd_find_device(info->dev_id);
 		if (ub) {
-			if (info->len < sizeof(*info))
+			if (info->len < sizeof(*info)|| !info->addr)
 				goto out;
 
 			if (!copy_to_user((void __user *)info->addr,
@@ -1197,8 +1197,22 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 
 			if (ubd_add_dev(ub))
 				ubd_remove(ub);
-			else
-				ret = UBD_CTRL_CMD_RES_OK;
+			else {
+				/*
+				 * If dev_id is set by ubd_drv but dev_info fails to return to userspace,
+				 * the userspace part cannot reference this device any more so we have to
+				 * remove the ubd_dev right now.
+				 */
+				if (info->len < sizeof(*info)
+					|| !info->addr
+					|| WARN_ON_ONCE(copy_to_user(
+						(void __user *)info->addr,
+						(void *)&ub->dev_info,
+						sizeof(*info))))
+					ubd_remove(ub);
+				else
+					ret = UBD_CTRL_CMD_RES_OK;
+			}
 		}
 		break;
 	case UBD_CMD_DEL_DEV:
