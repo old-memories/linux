@@ -46,8 +46,7 @@
 #include <linux/delay.h>
 #include <linux/mm.h>
 #include <asm/page.h>
-
-#include "ubd_cmd.h"
+#include <uapi/linux/ubd_cmd.h>
 
 #define UBD_MINORS		(1U << MINORBITS)
 
