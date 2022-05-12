@@ -67,7 +67,7 @@ struct ubd_io {
 	/* userspace buffer address from io cmd */
 	__u64	addr;
 	unsigned int flags;
-	unsigned int res;
+	int res;
 
 	struct io_uring_cmd *cmd;
 };
@@ -426,7 +426,7 @@ static void ubd_complete_rq(struct request *req)
 	 * block size has to be applied.
 	 */
 
-	blk_mq_end_request(req, io->res);
+	blk_mq_end_request(req, io->res >= 0 ? BLK_STS_OK : BLK_STS_IOERR);
 }
 
 static int ubd_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
