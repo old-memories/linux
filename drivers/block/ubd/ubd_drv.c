@@ -476,22 +476,23 @@ static int ubd_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 	size_t sz = vma->vm_end - vma->vm_start;
 	unsigned max_sz = UBD_MAX_QUEUE_DEPTH * sizeof(struct ubdsrv_io_desc);
 	unsigned long pfn;
-	int q_id = vma->vm_pgoff / max_sz;
+	unsigned long end = UBDSRV_CMD_BUF_OFFSET + ub->dev_info.nr_hw_queues* max_sz;
+	unsigned long phys_off = vma->vm_pgoff << PAGE_SHIFT;
+	int q_id;
 
-	if (vma->vm_pgoff == (UBDSRV_IO_BUF_OFFSET >> PAGE_SHIFT) &&
-			sz == ubd_io_buf_size(ub)) {
-		if (!ubd_support_zero_copy(ub))
-			return -EINVAL;
-		vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP;
-#ifdef DEBUG
-	printk("%s: mmaped buf vm addr %lx-%lx\n",
-			__func__, vma->vm_start, vma->vm_end);
-#endif
-		return 0;
-	}
-
-	if (vma->vm_pgoff != UBDSRV_CMD_BUF_OFFSET + q_id * max_sz)
+	if(phys_off < UBDSRV_CMD_BUF_OFFSET || phys_off >= end)
 		return -EINVAL;
+
+	q_id = (phys_off - UBDSRV_CMD_BUF_OFFSET) / max_sz;
+
+	if (phys_off != UBDSRV_CMD_BUF_OFFSET + q_id * max_sz)
+		return -EINVAL;
+
+#ifdef DEBUG
+	printk("%s: qid %d, pid %d, addr %lx pg_off %lx sz %lu\n",
+			__func__, q_id, current->pid, vma->vm_start,
+			phys_off, sz);
+#endif
 
 	if (sz != ubd_queue_cmd_buf_size(ub, q_id))
 		return -EINVAL;
