@@ -756,6 +756,9 @@ static int ubd_add_dev(struct ubd_device *ub)
 	ub->bs_shift = ilog2(bsize);
 	ub->max_io_buf_sz = ub->dev_info.rq_max_blocks << ub->bs_shift;
 
+	ub->dev_info.nr_hw_queues = min_t(unsigned int,
+			ub->dev_info.nr_hw_queues, nr_cpu_ids);
+
 	if (ubd_init_queues(ub))
 		return err;
 
