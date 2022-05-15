@@ -450,7 +450,6 @@ static int ubd_ch_open(struct inode *inode, struct file *filp)
 			struct ubd_device, cdev);
 
 	if (atomic_cmpxchg(&ub->ch_open_cnt, 0, 1) == 0) {
-		ub->ub_daemon = current;
 		filp->private_data = ub;
 		return 0;
 	}
@@ -464,7 +463,6 @@ static int ubd_ch_release(struct inode *inode, struct file *filp)
 	while (atomic_cmpxchg(&ub->ch_open_cnt, 1, 0) != 1) {
 		cpu_relax();
 	}
-	ub->ub_daemon = NULL;
 	filp->private_data = NULL;
 	return 0;
 }
@@ -940,19 +938,36 @@ static bool ubd_queue_ready(struct ubd_device *ub, int qid)
 	return ubd_active_io_cmd_cnt(ub, qid) == ub->dev_info.queue_depth;
 }
 
+static bool ubd_queues_ready(struct ubd_device *ub)
+{
+	struct ubdsrv_ctrl_dev_info *info = &ub->dev_info;
+	int cnt = 0;
+	int i;
+
+	for (i = 0; i < info->nr_hw_queues; i++)
+		cnt += ubd_queue_ready(ub, i);
+
+	return cnt == info->nr_hw_queues;
+}
+
 static int ubd_ctrl_stop_dev(struct ubd_device *ub, struct io_uring_cmd *cmd)
 {
-	int ret = -EINVAL;
+	int ret = 0;
+	int i;
 
 	mutex_lock(&ub->mutex);
 	if (!disk_live(ub->ub_disk))
 		goto unlock;
 
 	del_gendisk(ub->ub_disk);
-	ret = ubd_abort_queue(ub, 0);
+	
+	for(i=0; i < ub->dev_info.nr_hw_queues; i++)
+		ret += ubd_abort_queue(ub, i);
  unlock:
 	mutex_unlock(&ub->mutex);
-	//printk("%s: active cmds %d, ret %d\n", __func__, ubd_active_io_cmd_cnt(ub, 0), ret);
+#ifdef DEBUG
+	printk("%s: ret %d on %d queues\n", __func__, ret, ub->dev_info.nr_hw_queues);
+#endif
 	if (ret == 0)
 		ub->dev_info.ubdsrv_pid = -1;
 	return ret;
@@ -972,9 +987,8 @@ static int ubd_ctrl_start_dev(struct ubd_device *ub, struct io_uring_cmd *cmd)
 	ub->dev_info.ubdsrv_pid = info->ubdsrv_pid;
 	if (disk_live(ub->ub_disk))
 		goto unlock;
-	while (jiffies < end) {
-		/* only SQ is supported now */
-		if (ubd_queue_ready(ub, 0)) {
+	while (time_before(jiffies, end)) {
+		if (ubd_queues_ready(ub)) {
 			ret = 0;
 			break;
 		}
@@ -982,8 +996,9 @@ static int ubd_ctrl_start_dev(struct ubd_device *ub, struct io_uring_cmd *cmd)
 	}
  unlock:
 	mutex_unlock(&ub->mutex);
-	//printk("%s: active cmds %d\n", __func__, ubd_active_io_cmd_cnt(ub, 0));
-
+#ifdef DEBUG
+	printk("%s: device io ready, ret: %d\n", __func__, ret);
+#endif
 	if (ret == 0)
 		ret = add_disk(ub->ub_disk);
 
