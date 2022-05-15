@@ -336,9 +336,6 @@ static int ubd_setup_iod(struct ubd_queue *ubq, struct request *req)
 	case REQ_OP_DISCARD:
 		ubd_op = UBD_IO_OP_DISCARD;
 		break;
-	case REQ_OP_WRITE_SAME:
-		ubd_op = UBD_IO_OP_WRITE_SAME;
-		break;
 	case REQ_OP_WRITE_ZEROES:
 		ubd_op = UBD_IO_OP_WRITE_ZEROES;
 		break;
@@ -406,7 +403,7 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 			ubd_get_iod(ubq, rq->tag)->addr);
 #endif
 	/* tell ubdsrv one io request is coming */
-	io_uring_cmd_done(io->cmd, ret);
+	io_uring_cmd_done(io->cmd, ret, 0);
 
 	return BLK_STS_OK;
 }
@@ -541,7 +538,8 @@ static int ubd_ch_handle_get_data(struct ubd_device *ub,
 	return ubd_copy_pages(ub, req);
 }
 
-static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
+static int ubd_ch_uring_cmd(struct io_uring_cmd *cmd,
+		unsigned int issue_flags)
 {
 	struct ubdsrv_io_cmd *ub_cmd = (struct ubdsrv_io_cmd *)cmd->cmd;
 	struct ubd_device *ub = cmd->file->private_data;
@@ -552,6 +550,10 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 	int ret;
 
 	ret = UBD_IO_RES_INVALID_SQE;
+
+	if (!(issue_flags & IO_URING_F_SQE128))
+		goto out;
+
 	/* so far, only SQ is supported */
 	if (WARN_ON_ONCE(ub_cmd->q_id != 0))
 		goto out;
@@ -620,7 +622,7 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 
  out:
 	io->flags &= ~UBD_IO_FLAG_ACTIVE;
-	io_uring_cmd_done(cmd, ret);
+	io_uring_cmd_done(cmd, ret, 0);
 #ifdef DEBUG
 	printk("%s: complete: cmd op %d, tag %d ret %x io_flags %x\n", __func__,
 			cmd_op, tag, ret, io->flags);
@@ -633,7 +635,7 @@ static const struct file_operations ubd_ch_fops = {
 	.open = ubd_ch_open,
 	.release = ubd_ch_release,
 	.llseek = no_llseek,
-	.async_cmd = ubd_ch_async_cmd,
+	.uring_cmd = ubd_ch_uring_cmd,
 	.mmap = ubd_ch_mmap,
 };
 
@@ -909,7 +911,7 @@ static int ubd_abort_queue(struct ubd_device *ub, int qid)
 
 		if (io->flags & UBD_IO_FLAG_ACTIVE) {
 			io->flags &= ~UBD_IO_FLAG_ACTIVE;
-			io_uring_cmd_done(io->cmd, ret);
+			io_uring_cmd_done(io->cmd, ret, 0);
 		}
 	}
 	return 0;
@@ -991,8 +993,8 @@ static void ubd_dump(struct io_uring_cmd *cmd)
 #ifdef DEBUG
 	struct ubdsrv_ctrl_dev_info *info = (struct ubdsrv_ctrl_dev_info *)cmd->cmd;
 
-	printk("%s: cmd_op %x cmd_len %d, dev id %d flags %x\n",
-			__func__, cmd->cmd_op, cmd->cmd_len,
+	printk("%s: cmd_op %x, dev id %d flags %x\n",
+			__func__, cmd->cmd_op,
 			info->dev_id, info->flags);
 
 	printk("\t nr_hw_queues %d queue_depth %d block size %d dev_capacity %lld\n",
@@ -1007,7 +1009,8 @@ static bool ubd_ctrl_cmd_validate(struct io_uring_cmd *cmd)
 	return  true;
 }
 
-static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
+static int ubd_ctrl_uring_cmd(struct io_uring_cmd *cmd,
+		unsigned int issue_flags)
 {
 	struct ubdsrv_ctrl_dev_info *info = (struct ubdsrv_ctrl_dev_info *)cmd->cmd;
 	unsigned ret = UBD_CTRL_CMD_RES_FAILED;
@@ -1015,6 +1018,9 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 	struct ubd_device *ub;
 
 	ubd_dump(cmd);
+
+	if (!(issue_flags & IO_URING_F_SQE128))
+		goto out;
 
 	if (!ubd_ctrl_cmd_validate(cmd))
 		goto out;
@@ -1085,13 +1091,13 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 		break;
 	};
  out:
-	io_uring_cmd_done(cmd, ret);
+	io_uring_cmd_done(cmd, ret, 0);
 	return -EIOCBQUEUED;
 }
 
 static const struct file_operations ubd_ctl_fops = {
 	.open		= nonseekable_open,
-	.async_cmd      = ubd_ctrl_async_cmd,
+	.uring_cmd      = ubd_ctrl_uring_cmd,
 	.owner		= THIS_MODULE,
 	.llseek		= noop_llseek,
 };
