@@ -80,6 +80,7 @@ struct ubd_queue {
 
 	unsigned long io_addr;	/* mapped vm address */
 	unsigned max_io_sz;
+	bool aborted;
 	struct ubd_io ios[0];
 };
 
@@ -606,8 +607,14 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 			goto out;
 		}
 		ubd_commit_completion(ub, ub_cmd);
+		
+		/* if ubq->aborted, do not FETCH any more */
+		if(unlikely(ubq->aborted)) {
+			ret = UBD_IO_RES_ABORT;
+			goto out;
+		}
 		if (cmd_op == UBD_IO_COMMIT_REQ) {
-			ret = UBD_IO_RES_OK;
+			ret = UBD_IO_RES_ABORT;;
 			goto out;
 		}
 		break;
@@ -905,6 +912,8 @@ static int ubd_abort_queue(struct ubd_device *ub, int qid)
 	int ret = UBD_IO_RES_ABORT;
 	struct ubd_queue *q = &ub->queues[qid];
 	int i;
+
+	q->aborted = true;
 
 	for (i = 0; i < q->q_depth; i++) {
 		struct ubd_io *io = &q->ios[i];
