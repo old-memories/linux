@@ -402,9 +402,11 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 *    totally zero copy, but 4k block size has to be applied.
 	 */
 #ifdef DEBUG
-	printk("%s: complete: cmd op %d, tag %d ret %x io_flags %x, addr %lx\n",
-			__func__, io->cmd->cmd_op, rq->tag, ret, io->flags,
-			ubd_get_iod(ubq, rq->tag)->addr);
+	printk("%s: complete: cmd op %d q_id %d tag %d ret %x "
+			"io_flags %x addr %llx io_op %d\n",
+			__func__, io->cmd->cmd_op, ubq->q_id, rq->tag, ret, io->flags,
+			ubd_get_iod(ubq, rq->tag)->addr,
+			ubdsrv_get_op(ubd_get_iod(ubq, rq->tag)));
 #endif
 	/* tell ubdsrv one io request is coming */
 	io_uring_cmd_done(io->cmd, ret);
@@ -500,11 +502,6 @@ static int ubd_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 	return remap_pfn_range(vma, vma->vm_start, pfn, sz, vma->vm_page_prot);
 }
 
-static bool ubd_io_cmd_validate(struct io_uring_cmd *cmd)
-{
-	return  true;
-}
-
 static void ubd_commit_completion(struct ubd_device *ub,
 		struct ubdsrv_io_cmd *ub_cmd)
 {
@@ -549,25 +546,19 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 	struct ubd_io *io;
 	u32 cmd_op = cmd->cmd_op;
 	unsigned tag = ub_cmd->tag;
-	int ret;
-
-	ret = UBD_IO_RES_INVALID_SQE;
-	/* so far, only SQ is supported */
-	if (WARN_ON_ONCE(ub_cmd->q_id != 0))
-		goto out;
-
-	ubq = &ub->queues[ub_cmd->q_id];
-	if (WARN_ON_ONCE(tag >= ubq->q_depth))
-		goto out;
-
-	if (!ubd_io_cmd_validate(cmd))
-		goto out;
+	unsigned q_id = ub_cmd->q_id;
+	int ret = UBD_IO_RES_INVALID_SQE;
+	
+	ubq = &ub->queues[q_id];
+	
+	WARN_ON_ONCE(tag >= ubq->q_depth);
 
 	io = &ubq->ios[tag];
 
 #ifdef DEBUG
-	printk("%s: receieved: cmd op %d, tag %d ret %x io_flags %x\n", __func__,
-			cmd->cmd_op, tag, ret, io->flags);
+	printk("%s: receieved: cmd op %d, q_id %d "
+			"tag %d ret %x io_flags %x\n", __func__,
+			cmd->cmd_op, q_id, tag, ret, io->flags);
 #endif
 	/* there is pending io cmd, something must be wrong */
 	if (io->flags & UBD_IO_FLAG_ACTIVE) {
@@ -628,8 +619,11 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 	io->flags &= ~UBD_IO_FLAG_ACTIVE;
 	io_uring_cmd_done(cmd, ret);
 #ifdef DEBUG
-	printk("%s: complete: cmd op %d, tag %d ret %x io_flags %x\n", __func__,
-			cmd_op, tag, ret, io->flags);
+	printk("%s: complete: cmd op %d, q_id %d "
+			"tag %d ret %x io_flags %x "
+			"io_op %d\n", __func__,
+			cmd_op, q_id, tag, ret,
+			io->flags, ubdsrv_get_op(ubd_get_iod(ubq, tag)));
 #endif
 	return -EIOCBQUEUED;
 }
@@ -1019,7 +1013,7 @@ static void ubd_dump(struct io_uring_cmd *cmd)
 #ifdef DEBUG
 	struct ubdsrv_ctrl_dev_info *info = (struct ubdsrv_ctrl_dev_info *)cmd->cmd;
 
-	printk("%s: cmd_op %x cmd_len %d, dev id %d flags %x\n",
+	printk("%s: cmd_op %x cmd_len %d, dev id %d flags %llx\n",
 			__func__, cmd->cmd_op, cmd->cmd_len,
 			info->dev_id, info->flags);
 
