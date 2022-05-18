@@ -88,9 +88,11 @@ struct ubd_device {
 	struct gendisk		*ub_disk;
 	struct request_queue	*ub_queue;
 
-	struct ubd_queue	*queues;
+	char	                *__queues;
 
-	unsigned  bs_shift, max_io_buf_sz;
+	unsigned short          queue_size;
+	unsigned short          bs_shift;
+	unsigned int            max_io_buf_sz;
 	struct ubdsrv_ctrl_dev_info	dev_info;
 
 	struct task_struct	*ub_daemon;
@@ -114,6 +116,11 @@ static DEFINE_MUTEX(ubd_ctl_mutex);
 
 static struct miscdevice ubd_misc;
 
+static inline struct ubd_queue *ubd_get_queue(struct ubd_device *dev, int qid)
+{
+       return (struct ubd_queue *)&(dev->__queues[qid * dev->queue_size]);
+}
+
 static inline bool ubd_rq_need_copy(struct request *rq)
 {
 	return rq->bio && bio_has_data(rq->bio);
@@ -132,12 +139,12 @@ static inline struct ubdsrv_io_desc *ubd_get_iod(struct ubd_queue *ubq, int tag)
 
 static inline char *ubd_queue_cmd_buf(struct ubd_device *ub, int q_id)
 {
-	return ub->queues[q_id].io_cmd_buf;
+	return ubd_get_queue(ub, q_id)->io_cmd_buf;
 }
 
 static inline int ubd_queue_cmd_buf_size(struct ubd_device *ub, int q_id)
 {
-	struct ubd_queue *ubq = &ub->queues[q_id];
+	struct ubd_queue *ubq = ubd_get_queue(ub, q_id);
 
 	return round_up(ubq->q_depth * sizeof(struct ubdsrv_io_desc), PAGE_SIZE);
 }
@@ -436,7 +443,7 @@ static int ubd_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
 		unsigned int hctx_idx)
 {
 	struct ubd_device *ub = hctx->queue->queuedata;
-	struct ubd_queue *ubq = &ub->queues[hctx->queue_num];
+	struct ubd_queue *ubq = ubd_get_queue(ub, hctx->queue_num);
 
 	hctx->driver_data = ubq;
 	return 0;
@@ -506,7 +513,7 @@ static void ubd_commit_completion(struct ubd_device *ub,
 		struct ubdsrv_io_cmd *ub_cmd)
 {
 	u32 qid = ub_cmd->q_id, tag = ub_cmd->tag;
-	struct ubd_queue *ubq = &ub->queues[qid];
+	struct ubd_queue *ubq = ubd_get_queue(ub, qid);
 	struct ubd_io *io = &ubq->ios[tag];
 	struct request *req;
 
@@ -549,7 +556,7 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 	unsigned q_id = ub_cmd->q_id;
 	int ret = UBD_IO_RES_INVALID_SQE;
 	
-	ubq = &ub->queues[q_id];
+	ubq = ubd_get_queue(ub, q_id);
 	
 	WARN_ON_ONCE(tag >= ubq->q_depth);
 
@@ -640,7 +647,7 @@ static const struct file_operations ubd_ch_fops = {
 static void ubd_deinit_queue(struct ubd_device *ub, int q_id)
 {
 	int size = ubd_queue_cmd_buf_size(ub, q_id);
-	struct ubd_queue *ubq = &ub->queues[q_id];
+	struct ubd_queue *ubq = ubd_get_queue(ub, q_id);
 
 	if (ubq->io_cmd_buf)
 		free_pages((unsigned long)ubq->io_cmd_buf, get_order(size));
@@ -648,7 +655,7 @@ static void ubd_deinit_queue(struct ubd_device *ub, int q_id)
 
 static int ubd_init_queue(struct ubd_device *ub, int q_id)
 {
-	struct ubd_queue *ubq = &ub->queues[q_id];
+	struct ubd_queue *ubq = ubd_get_queue(ub, q_id);
 	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO;
 	void *ptr;
 	int size;
@@ -675,12 +682,12 @@ static void ubd_deinit_queues(struct ubd_device *ub)
 	int nr_queues = ub->dev_info.nr_hw_queues;
 	int i;
 
-	if (!ub->queues)
+	if (!ub->__queues)
 		return;
 
 	for (i = 0; i < nr_queues; i++)
 		ubd_deinit_queue(ub, i);
-	kfree(ub->queues);
+	kfree(ub->__queues);
 }
 
 static int ubd_init_queues(struct ubd_device *ub)
@@ -690,8 +697,9 @@ static int ubd_init_queues(struct ubd_device *ub)
 	int ubq_size = sizeof(struct ubd_queue) + depth * sizeof(struct ubd_io);
 	int i, ret = -ENOMEM;
 
-	ub->queues = kcalloc(nr_queues, ubq_size, GFP_KERNEL);
-	if (!ub->queues)
+	ub->queue_size = ubq_size;
+	ub->__queues = kcalloc(nr_queues, ubq_size, GFP_KERNEL);
+	if (!ub->__queues)
 		return ret;
 
 	for (i = 0; i < nr_queues; i++) {
@@ -904,7 +912,7 @@ free_mem:
 static int ubd_abort_queue(struct ubd_device *ub, int qid)
 {
 	int ret = UBD_IO_RES_ABORT;
-	struct ubd_queue *q = &ub->queues[qid];
+	struct ubd_queue *q = ubd_get_queue(ub, qid);
 	int i;
 
 	q->aborted = true;
@@ -923,7 +931,7 @@ static int ubd_abort_queue(struct ubd_device *ub, int qid)
 /* has to be called disk is dead or frozen */
 static int ubd_active_io_cmd_cnt(struct ubd_device *ub, int qid)
 {
-	struct ubd_queue *q = &ub->queues[qid];
+	struct ubd_queue *q = ubd_get_queue(ub, qid);
 	int i, cnt = 0;
 
 	for (i = 0; i < q->q_depth; i++) {
