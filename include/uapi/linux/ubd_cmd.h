@@ -1,11 +1,10 @@
 #ifndef FIO_UBDSRV_INC_H
 #define FIO_UBDSRV_INC_H
 
-/* ubd server command definition */
+/* This header is used by both kernel ubd_drv and userspace ubdsrv */
 
 /* CMD result code */
 #define UBD_CTRL_CMD_RES_OK		0
-#define UBD_CTRL_CMD_RES_FAILED		-1
 
 /*
  * Admin commands, issued by ubd server, and handled by ubd driver.
@@ -30,8 +29,6 @@
  *      driver, meantime FETCH_REQ is piggyback, and FETCH_REQ has to be
  *      handled before completing io request.
  *
- * COMMIT_REQ: issued via sqe(URING_CMD) after ubdserver handled this IO
- *      request, request's handling result is committed to ubd driver.
  *
  * GET_DATA: issued via sqe(URING_CMD) after ubdserver gets one WRITE IO
  *      cmd, for reading data from io request in ubdsrv context, this way
@@ -39,24 +36,16 @@
  */
 #define	UBD_IO_FETCH_REQ		0x20
 #define	UBD_IO_COMMIT_AND_FETCH_REQ	0x21
-#define	UBD_IO_COMMIT_REQ		0x22
-#define	UBD_IO_GET_DATA			0x23
+#define	UBD_IO_GET_DATA			0x22
 
-#define UBD_IO_RES_OK			0x01
-#define UBD_IO_RES_INVALID_SQE		0x5f
-#define UBD_IO_RES_INVALID_TAG		0x5e
-#define UBD_IO_RES_INVALID_QUEUE	0x5d
-#define UBD_IO_RES_BUSY			0x5c
-#define UBD_IO_RES_DUP_FETCH		0x5b
-#define UBD_IO_RES_UNEXPECTED_CMD	0x5a
-
+#define UBD_IO_RES_OK			0
 /* only ABORT means that no re-fetch */
-#define UBD_IO_RES_ABORT		0x59
+#define UBD_IO_RES_ABORT		(-ENODEV)
 
 #define UBDSRV_CMD_BUF_OFFSET	0
 #define UBDSRV_IO_BUF_OFFSET	0x80000000
 
-/* tag bit is 12bit, so at most 4096 IOs for each queue */
+/* manually allow at most 4096 IOs for each queue */
 #define UBD_MAX_QUEUE_DEPTH	4096
 
 /*
@@ -86,7 +75,6 @@ struct ubdsrv_ctrl_dev_info {
 	 */
 	__u64	addr;
 	__u32	len;
-	__s32	ubdsrv_pid;
 	__u64	reserved0[2];
 };
 
@@ -128,45 +116,26 @@ struct ubdsrv_io_desc {
 	/* op: bit 0-7, flags: bit 8-31 */
 	__u32		op_flags;
 
-	/*
-	 * tag: bit 0 - 11, max: 4096
-	 *
-	 * blocks: bit 12 ~ 31, max: 1M blocks
-	 */
-	__u32		tag_blocks;
+	/*  number of sectors, max 4G */
+	__u32		sectors;
 
-	/* start block for this io */
-	__u64		start_block;
-
-	/* buffer address in ubdsrv daemon vm space, from ubd driver */
-	__u64		addr;
+	/* start sector for this io */
+	__u64		start_sector;
 };
 
-static inline __u8 ubdsrv_get_op(const struct ubdsrv_io_desc *iod)
+static inline __u8 ubdsrv_get_op(struct ubdsrv_io_desc *iod)
 {
 	return iod->op_flags & 0xff;
 }
 
-static inline __u32 ubdsrv_get_flags(const struct ubdsrv_io_desc *iod)
+static inline __u32 ubdsrv_get_flags(struct ubdsrv_io_desc *iod)
 {
 	return iod->op_flags >> 8;
 }
 
-static inline __u32 ubdsrv_get_blocks(const struct ubdsrv_io_desc *iod)
-{
-	return iod->tag_blocks >> 12;
-}
-
 /* issued to ubd driver via /dev/ubdcN */
 struct ubdsrv_io_cmd {
-	/*
-	 * how to support MQ ?
-	 *
-	 * Each hw queue is served by dedicated daemon? Or pthread
-	 * of this daemon?
-	 *
-	 * Served as reserved field.
-	 */
+	/* MQ support */
 	__u16	q_id;
 
 	/* for fetch/commit which result */
@@ -176,8 +145,10 @@ struct ubdsrv_io_cmd {
 	__s32	result;
 
 	/*
-	 * userspace buffer address in ubdsrv daemon process, valid for
-	 * FETCH* command only
+	 * app provided userspace buffer address, 
+	 * valid with two types of ubd io commands:
+	 * (1) COMMIT_AND_FETCH_REQ: addr of buf for ubd_drv to read
+	 * (2) UBD_IO_GET_DATA: addr of buf for ubd_drv to write
 	 */
 	__u64	addr;
 };

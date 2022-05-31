@@ -78,7 +78,6 @@ struct ubd_queue {
 
 	char *io_cmd_buf;
 
-	unsigned long io_addr;	/* mapped vm address */
 	unsigned max_io_sz;
 	bool aborted;
 	struct ubd_io ios[0];
@@ -149,25 +148,9 @@ static inline int ubd_queue_cmd_buf_size(struct ubd_device *ub, int q_id)
 	return round_up(ubq->q_depth * sizeof(struct ubdsrv_io_desc), PAGE_SIZE);
 }
 
-/* used for allocating zero copy vma space */
-static inline int ubd_queue_single_io_buf_size(struct ubd_device *ub)
+static inline unsigned int ubd_queue_max_io_size(struct ubd_device *ub)
 {
-	unsigned max_io_sz = ub->dev_info.rq_max_blocks << ub->bs_shift;
-
-	return round_up(max_io_sz, PAGE_SIZE);
-}
-static inline int ubd_queue_io_buf_size(struct ubd_device *ub)
-{
-	unsigned depth = ub->dev_info.queue_depth;
-
-	return ubd_queue_single_io_buf_size(ub) * depth;
-}
-
-static inline int ubd_io_buf_size(struct ubd_device *ub)
-{
-	unsigned nr_queues = ub->dev_info.nr_hw_queues;
-
-	return ubd_queue_io_buf_size(ub) * nr_queues;
+	return round_up(ub->max_io_buf_sz, PAGE_SIZE);
 }
 
 static int ubd_open(struct block_device *bdev, fmode_t mode)
@@ -232,7 +215,11 @@ static inline unsigned ubd_copy_bv(struct bio_vec *bv, void **bv_addr,
 	return len;
 }
 
-/* copy rq pages to ubdsrv vm addresss pointed by io->addr, for WRITE */
+/* 
+ * copy data for WRITE and READ:
+ * WRITE: copy rq pages to ubdsrv buffer pointed by io->addr
+ * READ: copy ubdsrv buffer pointed by io->addr to rq pages
+ */
 static int ubd_copy_pages(struct ubd_device *ub, struct request *rq)
 {
 	struct ubd_queue *ubq = rq->mq_hctx->driver_data;
@@ -274,8 +261,8 @@ refill:
 				nr_pin = min_t(unsigned, UBD_MAX_PIN_PAGES, max_pages);
 				nr_pin = ubd_pin_user_pages(ub, start, pgs,
 						nr_pin, to_rq);
-				if (nr_pin <= 0)
-					return -EINVAL;
+				if (nr_pin < 0)
+					return nr_pin;
 				idx = 0;
 			}
 			pg_off = off;
@@ -313,13 +300,12 @@ refill:
 	return 0;
 }
 
-#define UBD_REMAP_BATCH	32
-
+/* TODO: zero copy support */
 static int ubd_unmap_io(struct request *req)
 {
 	struct ubd_device *ub = req->q->queuedata;
 
-	/* no zero copy, just copy user buffer to request pages for READ */
+	/* copy user buffer to request pages for READ */	
 	if (!op_is_write(req->cmd_flags) && ubd_rq_need_copy(req))
 		return ubd_copy_pages(ub, req);
 	return 0;
@@ -328,7 +314,6 @@ static int ubd_unmap_io(struct request *req)
 static int ubd_setup_iod(struct ubd_queue *ubq, struct request *req)
 {
 	struct ubdsrv_io_desc *iod = ubd_get_iod(ubq, req->tag);
-	struct ubd_io *io = &ubq->ios[req->tag];
 	u32 flags = req->cmd_flags & ~REQ_OP_MASK;
 	u32 ubd_op;
 
@@ -357,9 +342,8 @@ static int ubd_setup_iod(struct ubd_queue *ubq, struct request *req)
 
 	/* need to translate since kernel may change */
 	iod->op_flags = ubd_op | flags;
-	iod->tag_blocks = req->tag | (blk_rq_sectors(req) << 12);
-	iod->start_block = blk_rq_pos(req);
-	iod->addr = io->addr;
+	iod->sectors = blk_rq_sectors(req);
+	iod->start_sector = blk_rq_pos(req);
 
 	return BLK_STS_OK;
 }
@@ -369,6 +353,7 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 {
 	int ret = UBD_IO_RES_OK;
 	struct ubd_queue *ubq = hctx->driver_data;
+	struct ubd_device *ub = hctx->queue->queuedata;
 	struct request *rq = bd->rq;
 	struct ubd_io *io = &ubq->ios[rq->tag];
 	blk_status_t res;
@@ -380,8 +365,7 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (WARN_ON_ONCE(!(io->flags & UBD_IO_FLAG_ACTIVE)))
 		return BLK_STS_IOERR;
 
-	WARN_ON_ONCE(bd->rq->__data_len >
-			ubd_queue_single_io_buf_size(rq->q->queuedata));
+	WARN_ON_ONCE(bd->rq->__data_len > ubd_queue_max_io_size(ub));
 
 	/* fill iod to slot in io cmd buffer */
 	res = ubd_setup_iod(ubq, rq);
@@ -428,14 +412,6 @@ static void ubd_complete_rq(struct request *req)
 	struct ubd_io *io = &ubq->ios[req->tag];
 
 	ubd_unmap_io(req);
-
-	/*
-	 * for READ request, writing data in iod->addr to rq buffers; or
-	 * we can remap rq pages to ubsrv vm space in ubd_queue_rq(), and
-	 * return the mapped address to ubdsrv via iod->addr before
-	 * returning fetch command, then it is totally zero copy, but 4k
-	 * block size has to be applied.
-	 */
 
 	blk_mq_end_request(req, io->res >= 0 ? BLK_STS_OK : BLK_STS_IOERR);
 }
@@ -485,7 +461,8 @@ static int ubd_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 	size_t sz = vma->vm_end - vma->vm_start;
 	unsigned max_sz = UBD_MAX_QUEUE_DEPTH * sizeof(struct ubdsrv_io_desc);
 	unsigned long pfn;
-	unsigned long end = UBDSRV_CMD_BUF_OFFSET + ub->dev_info.nr_hw_queues* max_sz;
+	unsigned long end = UBDSRV_CMD_BUF_OFFSET + 
+			ub->dev_info.nr_hw_queues * max_sz;
 	unsigned long phys_off = vma->vm_pgoff << PAGE_SHIFT;
 	int q_id;
 
@@ -542,7 +519,7 @@ static int ubd_ch_handle_get_data(struct ubd_device *ub,
 	if (!op_is_write(req->cmd_flags) || !ubd_rq_need_copy(req))
 		return 0;
 
-	/* convert to data copy in current context */
+	/* copy request pages to user buffer for WRITE */	
 	return ubd_copy_pages(ub, req);
 }
 
@@ -555,7 +532,7 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 	u32 cmd_op = cmd->cmd_op;
 	unsigned tag = ub_cmd->tag;
 	unsigned q_id = ub_cmd->q_id;
-	int ret = UBD_IO_RES_INVALID_SQE;
+	int ret = -EINVAL;
 	
 	ubq = ubd_get_queue(ub, q_id);
 	
@@ -570,8 +547,8 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 #endif
 	/* there is pending io cmd, something must be wrong */
 	if (io->flags & UBD_IO_FLAG_ACTIVE) {
-		ret = UBD_IO_RES_BUSY;
-		goto out;
+		ret = -EBUSY;
+		goto cmd_done;
 	}
 
 	switch (cmd_op) {
@@ -580,50 +557,80 @@ static int ubd_ch_async_cmd(struct io_uring_cmd *cmd)
 		 * The io is being handled by server, so COMMIT_RQ is expected
 		 * instead of FETCH_REQ
 		 */
-		if (io->flags & UBD_IO_FLAG_OWNED_BY_SRV) {
-			ret = UBD_IO_RES_DUP_FETCH;
-			goto out;
-		}
+		if (io->flags & UBD_IO_FLAG_OWNED_BY_SRV)
+			goto cmd_done;
+		
+		/* Since UBD_IO_FETCH_REQ is always sent in the first round,
+		 * ubd_drv does not set io->addr
+		 */
 		io->cmd = cmd;
 		io->flags |= UBD_IO_FLAG_ACTIVE;
-		/* so far we only support pre-allocate fixed buffer */
-		io->addr = ub_cmd->addr;
 		break;
 	case UBD_IO_GET_DATA:
 		/* GET_DATA is basically stateless */
 		if (!(io->flags & UBD_IO_FLAG_OWNED_BY_SRV))
-			goto out;
+			goto cmd_done;
+		/* 
+		 * (1) ubd_drv tells(returns a cqe) ubdsrv an incoming
+		 *     WRITE request with data size
+		 * 
+		 * (2) ubdsrv should alloc a new userspace buf addr
+		 *     (addr is ub_cmd->addr) and data to be written stored in it
+		 * 
+		 * (3) ubdsrv tells(issues a sqe with UBD_IO_GET_DATA)
+		 *     ubd_drv to copy data into the buf for a WRITE request
+		 * 
+		 * (4) ubd_drv copys data into it(ubd_ch_handle_get_data) and 
+		 *     issues the WRITE request(returns a cqe) to ubdsrv again
+		 * 
+		 * (5) ubdsrv handles the request and tells
+		 *     (issues a sqe with UBD_IO_COMMIT_AND_FETCH_REQ) 
+		 *     ubd_drv the result
+		 * 
+		 * (6) ubd_drv completes the request
+		 */
+		io->addr = ub_cmd->addr;
+		
 		if (!ubd_ch_handle_get_data(ub, ub_cmd))
 			ret = UBD_IO_RES_OK;
-		goto out;
+		goto cmd_done;
 	case UBD_IO_COMMIT_AND_FETCH_REQ:
+		if (!(io->flags & UBD_IO_FLAG_OWNED_BY_SRV))
+			goto cmd_done;
+		
 		io->flags |= UBD_IO_FLAG_ACTIVE;
-		fallthrough;
-	case UBD_IO_COMMIT_REQ:
 		io->cmd = cmd;
-		if (!(io->flags & UBD_IO_FLAG_OWNED_BY_SRV)) {
-			ret = UBD_IO_RES_UNEXPECTED_CMD;
-			goto out;
-		}
+		
+		/* 
+		 * (1) ubd_drv tells(returns a cqe) ubdsrv an incoming
+		 *     READ request with data size
+		 * 
+		 * (2) ubdsrv should alloc a new userspace buf 
+		 *     (addr is ub_cmd->addr) and data to be read stored in it
+		 * 
+		 * (3) ubdsrv tells(issues a sqe with UBD_IO_COMMIT_AND_FETCH_REQ) 
+		 *     ubd_drv to copy data from it for a READ request
+		 * 
+		 * (4) ubd_drv copys data from it and the request is completed
+		 */
+		io->addr = ub_cmd->addr;
+		
 		ubd_commit_completion(ub, ub_cmd);
 		
-		/* if ubq->aborted, do not FETCH any more */
+#if 0
+		/* if ubq->aborted, do not FETCH requests any more */
 		if(unlikely(ubq->aborted)) {
 			ret = UBD_IO_RES_ABORT;
 			goto out;
 		}
-		if (cmd_op == UBD_IO_COMMIT_REQ) {
-			ret = UBD_IO_RES_ABORT;;
-			goto out;
-		}
+#endif
 		break;
 	default:
-		ret = UBD_IO_RES_UNEXPECTED_CMD;
-		goto out;
+		goto cmd_done;
 	}
 	return -EIOCBQUEUED;
 
- out:
+cmd_done:
 	io->flags &= ~UBD_IO_FLAG_ACTIVE;
 	io_uring_cmd_done(cmd, ret);
 #ifdef DEBUG
@@ -980,23 +987,16 @@ static int ubd_ctrl_stop_dev(struct ubd_device *ub, struct io_uring_cmd *cmd)
 #ifdef DEBUG
 	printk("%s: ret %d on %d queues\n", __func__, ret, ub->dev_info.nr_hw_queues);
 #endif
-	if (ret == 0)
-		ub->dev_info.ubdsrv_pid = -1;
 	return ret;
 }
 
 static int ubd_ctrl_start_dev(struct ubd_device *ub, struct io_uring_cmd *cmd)
 {
-	struct ubdsrv_ctrl_dev_info *info = (struct ubdsrv_ctrl_dev_info *)cmd->cmd;
 	int ret = -EINVAL;
 	unsigned long end = jiffies + 3 * HZ;
 
-	if (info->ubdsrv_pid <= 0)
-		return -1;
-
 	mutex_lock(&ub->mutex);
 
-	ub->dev_info.ubdsrv_pid = info->ubdsrv_pid;
 	if (disk_live(ub->ub_disk))
 		goto unlock;
 	while (time_before(jiffies, end)) {
@@ -1041,43 +1041,56 @@ static bool ubd_ctrl_cmd_validate(struct io_uring_cmd *cmd)
 static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 {
 	struct ubdsrv_ctrl_dev_info *info = (struct ubdsrv_ctrl_dev_info *)cmd->cmd;
-	unsigned ret = UBD_CTRL_CMD_RES_FAILED;
+	unsigned ret = -EINVAL;
 	u32 cmd_op = cmd->cmd_op;
 	struct ubd_device *ub;
 
 	ubd_dump(cmd);
 
 	if (!ubd_ctrl_cmd_validate(cmd))
-		goto out;
+		goto cmd_done;
 
+	ret = -ENODEV;
 	switch (cmd_op) {
 	case UBD_CMD_START_DEV:
 		ub = ubd_find_device(info->dev_id);
 		if (!ub)
-			goto out;
+			goto cmd_done;
 		if (!ubd_ctrl_start_dev(ub, cmd))
 			ret = UBD_CTRL_CMD_RES_OK;
 		break;
 	case UBD_CMD_STOP_DEV:
 		ub = ubd_find_device(info->dev_id);
 		if (!ub)
-			goto out;
+			goto cmd_done;
 		if (!ubd_ctrl_stop_dev(ub, cmd))
 			ret = UBD_CTRL_CMD_RES_OK;
 		break;
 	case UBD_CMD_GET_DEV_INFO:
+		if (info->len < sizeof(*info)|| !info->addr) {
+			ret = -EINVAL;
+			goto cmd_done;
+		}
 		ub = ubd_find_device(info->dev_id);
 		if (ub) {
-			if (info->len < sizeof(*info)|| !info->addr)
-				goto out;
-
-			if (!copy_to_user((void __user *)info->addr,
+			if (copy_to_user((void __user *)info->addr,
 						(void *)&ub->dev_info,
 						sizeof(*info)))
+				ret = -EFAULT;
+			else
 				ret = UBD_CTRL_CMD_RES_OK;
 		}
 		break;
+	/*
+	* If dev_id is set by ubd_drv but dev_info fails to return to userspace,
+	* the userspace part cannot reference this device any more so we have to
+	* remove the ubd_dev right now.
+	*/
 	case UBD_CMD_ADD_DEV:
+		if (info->len < sizeof(*info)|| !info->addr) {
+			ret = -EINVAL;
+			goto cmd_done;
+		}
 		ub = ubd_create_dev(info->dev_id);
 		if (!IS_ERR_OR_NULL(ub)) {
 			memcpy(&ub->dev_info, info, sizeof(*info));
@@ -1085,24 +1098,13 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 			/* update device id */
 			ub->dev_info.dev_id = ub->ub_number;
 
-			if (ubd_add_dev(ub))
-				ubd_remove(ub);
-			else {
-				/*
-				 * If dev_id is set by ubd_drv but dev_info fails to return to userspace,
-				 * the userspace part cannot reference this device any more so we have to
-				 * remove the ubd_dev right now.
-				 */
-				if (info->len < sizeof(*info)
-					|| !info->addr
-					|| WARN_ON_ONCE(copy_to_user(
+			if (ubd_add_dev(ub) || copy_to_user(
 						(void __user *)info->addr,
 						(void *)&ub->dev_info,
-						sizeof(*info))))
-					ubd_remove(ub);
-				else
-					ret = UBD_CTRL_CMD_RES_OK;
-			}
+						sizeof(*info)))
+				ubd_remove(ub);
+			else 
+				ret = UBD_CTRL_CMD_RES_OK;
 		}
 		break;
 	case UBD_CMD_DEL_DEV:
@@ -1115,7 +1117,7 @@ static int ubd_ctrl_async_cmd(struct io_uring_cmd *cmd)
 	default:
 		break;
 	};
- out:
+cmd_done:
 	io_uring_cmd_done(cmd, ret);
 	return -EIOCBQUEUED;
 }
