@@ -395,9 +395,8 @@ static blk_status_t ubd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 */
 #ifdef DEBUG
 	printk("%s: complete: cmd op %d q_id %d tag %d ret %x "
-			"io_flags %x addr %llx io_op %d\n",
+			"io_flags %x io_op %d\n",
 			__func__, io->cmd->cmd_op, ubq->q_id, rq->tag, ret, io->flags,
-			ubd_get_iod(ubq, rq->tag)->addr,
 			ubdsrv_get_op(ubd_get_iod(ubq, rq->tag)));
 #endif
 	/* tell ubdsrv one io request is coming */
