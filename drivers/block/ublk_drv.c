@@ -605,11 +605,9 @@ static void ublk_complete_rq(struct request *req)
 }
 
 /*
- * __ublk_fail_req() may be called from abort context or ->ubq_daemon
- * context during exiting, so lock is required.
- *
- * Also aborting may not be started yet, keep in mind that one failed
- * request may be issued by block layer again.
+ * Since __ublk_rq_task_work always fails requests immediately during
+ * exiting, __ublk_fail_req() is only called from abort context during
+ * exiting. So lock is unnecessary.
  */
 static void __ublk_fail_req(struct ublk_io *io, struct request *req)
 {
