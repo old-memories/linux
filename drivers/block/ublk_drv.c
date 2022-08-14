@@ -686,14 +686,13 @@ static inline void __ublk_rq_task_work(struct request *req)
 	/*
 	 * Task is exiting if either:
 	 *
-	 * (1) current != ubq->ubq_daemon.
+	 * (1) current != ubq_daemon.
 	 *     This is because io_uring_cmd_complete_in_task() tries to run current task_work
 	 *     in a workqueue if ubq_daemon(cmd's task) is PF_EXITING.
 	 *
-	 * (2) ubq_daemon_is_dying().
-	 *     ubq_daemon(cmd's task) is PF_EXITING.
+	 * (2) current->flags & PF_EXITING.
 	 */
-	bool task_exiting = current != ubq->ubq_daemon || ubq_daemon_is_dying(ubq);
+	bool task_exiting = current != ubq->ubq_daemon || current->flags & PF_EXITING;
 	unsigned int mapped_bytes;
 
 	pr_devel("%s: task %px complete: cmd %px op %d, qid %d tag %d io_flags %x addr %llx\n",
