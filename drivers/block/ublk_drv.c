@@ -37,7 +37,6 @@
 #include <linux/uaccess.h>
 #include <linux/cdev.h>
 #include <linux/io_uring.h>
-#include <linux/io_uring_types.h>
 #include <linux/blk-mq.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
@@ -583,14 +582,6 @@ static inline struct ublk_uring_cmd_pdu *ublk_get_uring_cmd_pdu(
 		struct io_uring_cmd *ioucmd)
 {
 	return (struct ublk_uring_cmd_pdu *)&ioucmd->pdu;
-}
-
-static inline struct delayed_work *get_ioucmd_fallback_work(struct io_uring_cmd *ioucmd)
-{
-	struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
-	struct io_ring_ctx *ctx = req->ctx;
-	
-	return &ctx->fallback_work;
 }
 
 static inline bool ubq_daemon_is_dying(struct ublk_queue *ubq)
@@ -1818,7 +1809,6 @@ static void ublk_reinit_queue_recovery(struct ublk_device *ub, struct ublk_queue
 {
 	struct ublk_io *io;
 	int i;
-	bool fallback_work_flushed = false;
 
 	/* old daemon is PF_EXITING, put it now */
 	put_task_struct(ubq->ubq_daemon);
@@ -1826,8 +1816,6 @@ static void ublk_reinit_queue_recovery(struct ublk_device *ub, struct ublk_queue
 
 	for (i = 0; i < ubq->q_depth; i++) {
 		io = &ubq->ios[i];
-		pr_devel("%s: qid %d tag %d io_flags %x\n",
-				__func__, ubq->q_id, i, io->flags);
 		if (!(io->flags & UBLK_IO_FLAG_ACTIVE)) {
 			struct request *rq;
 			
@@ -1837,11 +1825,15 @@ static void ublk_reinit_queue_recovery(struct ublk_device *ub, struct ublk_queue
 
 			/* requeue this req(won't be scheduled now) */
 			if (ublk_can_use_recovery_reissue(ub)) {
+					pr_devel("%s: requeue req: qid %d tag %d io_flags %x\n",
+							__func__, ubq->q_id, i, io->flags);
 					blk_mq_requeue_request(rq, false);
 					blk_mq_delay_kick_requeue_list(rq->q,
 							UBLK_REQUEUE_DELAY_MS);
 			/* abort this req */
 			} else {
+				pr_devel("%s abort req: qid %d tag %d io_flags %x\n",
+						__func__, ubq->q_id, i, io->flags);
 				/*
 				 * Laterly, rq may be issued again but ublk_queue_rq()
 				 * cannot be called until we unquiesce the queue.
@@ -1849,13 +1841,8 @@ static void ublk_reinit_queue_recovery(struct ublk_device *ub, struct ublk_queue
 				blk_mq_end_request(rq, BLK_STS_IOERR);
 			}
 		} else {
-			/* flush iouring ctx fallback_work then we are safe to cancel old ioucmd */
-			if(!fallback_work_flushed) {
-				flush_delayed_work(get_ioucmd_fallback_work(io->cmd));
-				fallback_work_flushed = true;
-				pr_devel("%s: flush fallback_work: qid %d tag %d io_flags %x\n",
-						__func__, ubq->q_id, i, io->flags);
-			}
+			pr_devel("%s cancel old cmd: cmd %px qid %d tag %d io_flags %x\n",
+					__func__, io->cmd, ubq->q_id, i, io->flags);
 			/* cancel the old ioucmd so iouring ctx can be freed eventually */
 			io_uring_cmd_done(io->cmd, 0, 0);
 		}
