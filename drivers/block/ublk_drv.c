@@ -49,17 +49,17 @@
 /* All UBLK_F_* have to be included into UBLK_F_ALL */
 #define UBLK_F_ALL (UBLK_F_SUPPORT_ZERO_COPY \
 		| UBLK_F_URING_CMD_COMP_IN_TASK \
-		| UBLK_F_NEED_GET_DATA)
+		| UBLK_F_NEED_GET_DATA \
+		| UBLK_F_USER_RECOVERY \
+		| UBLK_F_USER_RECOVERY_REISSUE)
 
 /* All UBLK_PARAM_TYPE_* should be included here */
 #define UBLK_PARAM_TYPE_ALL (UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD)
 
-struct ublk_rq_data {
-	struct callback_head work;
-};
-
 struct ublk_uring_cmd_pdu {
-	struct request *req;
+	int q_id;
+	int tag;
+	struct callback_head work;
 };
 
 /*
@@ -122,6 +122,7 @@ struct ublk_queue {
 	bool abort_work_pending;
 	unsigned short nr_io_ready;	/* how many ios setup */
 	struct ublk_device *dev;
+	bool force_abort;
 	struct ublk_io ios[0];
 };
 
@@ -321,6 +322,32 @@ static inline int ublk_queue_cmd_buf_size(struct ublk_device *ub, int q_id)
 
 	return round_up(ubq->q_depth * sizeof(struct ublksrv_io_desc),
 			PAGE_SIZE);
+}
+
+/*
+ * TODO: UBLK_F_USER_RECOVERY should be a flag for device, not for queue,
+ * since "some queues are aborted while others are recoverd" is really wierd.
+ */
+static inline bool ublk_can_use_recovery(struct ublk_device *ub)
+{
+	struct ublk_queue *ubq = ublk_get_queue(ub, 0);
+	
+	if (ubq->flags & UBLK_F_USER_RECOVERY)
+		return true;
+	return false;
+}
+
+/*
+ * TODO: UBLK_F_USER_RECOVERY_REISSUE should be a flag for device, not for queue,
+ * since "some queues are aborted while others are recoverd" is really wierd.
+ */
+static inline bool ublk_can_use_recovery_reissue(struct ublk_device *ub)
+{
+	struct ublk_queue *ubq = ublk_get_queue(ub, 0);
+
+	if (ubq->flags & (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE))
+		return true;
+	return false;
 }
 
 static void ublk_free_disk(struct gendisk *disk)
@@ -555,6 +582,12 @@ static inline struct ublk_uring_cmd_pdu *ublk_get_uring_cmd_pdu(
 	return (struct ublk_uring_cmd_pdu *)&ioucmd->pdu;
 }
 
+static inline struct io_uring_cmd *ublk_uring_cmd_from_pdu(
+			struct ublk_uring_cmd_pdu *pdu)
+{
+	return container_of((u8 *)pdu, struct io_uring_cmd, pdu[0]);		
+}
+
 static inline bool ubq_daemon_is_dying(struct ublk_queue *ubq)
 {
 	return ubq->ubq_daemon->flags & PF_EXITING;
@@ -566,6 +599,9 @@ static void ublk_complete_rq(struct request *req)
 	struct ublk_queue *ubq = req->mq_hctx->driver_data;
 	struct ublk_io *io = &ubq->ios[req->tag];
 	unsigned int unmapped_bytes;
+
+	pr_devel("%s complete req: qid %d tag %d io_flags %d\n",
+			__func__, ubq->q_id, req->tag, io->flags);
 
 	/* failed read IO if nothing is read */
 	if (!io->res && req_op(req) == REQ_OP_READ)
@@ -604,21 +640,6 @@ static void ublk_complete_rq(struct request *req)
 		__blk_mq_end_request(req, BLK_STS_OK);
 }
 
-/*
- * Since __ublk_rq_task_work always fails requests immediately during
- * exiting, __ublk_fail_req() is only called from abort context during
- * exiting. So lock is unnecessary.
- */
-static void __ublk_fail_req(struct ublk_io *io, struct request *req)
-{
-	WARN_ON_ONCE(io->flags & UBLK_IO_FLAG_ACTIVE);
-
-	if (!(io->flags & UBLK_IO_FLAG_ABORTED)) {
-		io->flags |= UBLK_IO_FLAG_ABORTED;
-		blk_mq_end_request(req, BLK_STS_IOERR);
-	}
-}
-
 static void ubq_complete_io_cmd(struct ublk_io *io, int res)
 {
 	/* mark this cmd owned by ublksrv */
@@ -630,30 +651,46 @@ static void ubq_complete_io_cmd(struct ublk_io *io, int res)
 	 */
 	io->flags &= ~UBLK_IO_FLAG_ACTIVE;
 
+	pr_devel("%s: complete: cmd %px op %d, res %d io_flags %x\n",
+			__func__, io->cmd, io->cmd->cmd_op, res, io->flags);
+
 	/* tell ublksrv one io request is coming */
 	io_uring_cmd_done(io->cmd, res, 0);
 }
 
 #define UBLK_REQUEUE_DELAY_MS	3
 
-static inline void __ublk_rq_task_work(struct request *req)
+static inline void __ublk_rq_task_work(struct io_uring_cmd *cmd)
 {
-	struct ublk_queue *ubq = req->mq_hctx->driver_data;
-	struct ublk_device *ub = ubq->dev;
-	int tag = req->tag;
-	struct ublk_io *io = &ubq->ios[tag];
-	bool task_exiting = current != ubq->ubq_daemon || ubq_daemon_is_dying(ubq);
+	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
+	struct ublk_device *ub = cmd->file->private_data;
+	struct ublk_queue *ubq = ublk_get_queue(ub, pdu->q_id);
+	struct ublk_io *io;
+	struct request *req;
 	unsigned int mapped_bytes;
-
-	pr_devel("%s: complete: op %d, qid %d tag %d io_flags %x addr %llx\n",
-			__func__, io->cmd->cmd_op, ubq->q_id, req->tag, io->flags,
-			ublk_get_iod(ubq, req->tag)->addr);
-
-	if (unlikely(task_exiting)) {
-		blk_mq_end_request(req, BLK_STS_IOERR);
-		mod_delayed_work(system_wq, &ub->monitor_work, 0);
+	/*
+	 * Task is exiting if either:
+	 *
+	 * (1) current != ubq_daemon.
+	 * io_uring_cmd_complete_in_task() tries to run task_work
+	 * in a workqueue if ubq_daemon(cmd's task) is PF_EXITING.
+	 *
+	 * (2) current->flags & PF_EXITING.
+	 */
+	if (unlikely(current != ubq->ubq_daemon || current->flags & PF_EXITING)) {
+		pr_devel("%s: task %px done old cmd: qid %d tag %d cmd %px\n",
+				__func__, current, pdu->q_id, pdu->tag, cmd);
+		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, 0);
 		return;
 	}
+
+	io = &ubq->ios[pdu->tag];
+	req = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], pdu->tag);
+	WARN_ON_ONCE(!req);
+
+	pr_devel("%s: complete: cmd %px op %d, qid %d tag %d io_flags %x addr %llx\n",
+			__func__, cmd, cmd->cmd_op, ubq->q_id, req->tag, io->flags,
+			ublk_get_iod(ubq, req->tag)->addr);
 
 	if (ublk_need_get_data(ubq) &&
 			(req_op(req) == REQ_OP_WRITE ||
@@ -711,18 +748,16 @@ static inline void __ublk_rq_task_work(struct request *req)
 
 static void ublk_rq_task_work_cb(struct io_uring_cmd *cmd)
 {
-	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
-
-	__ublk_rq_task_work(pdu->req);
+	__ublk_rq_task_work(cmd);
 }
 
 static void ublk_rq_task_work_fn(struct callback_head *work)
 {
-	struct ublk_rq_data *data = container_of(work,
-			struct ublk_rq_data, work);
-	struct request *req = blk_mq_rq_from_pdu(data);
+	struct ublk_uring_cmd_pdu *pdu = container_of(work,
+			struct ublk_uring_cmd_pdu, work);
+	struct io_uring_cmd *cmd = ublk_uring_cmd_from_pdu(pdu);
 
-	__ublk_rq_task_work(req);
+	__ublk_rq_task_work(cmd);
 }
 
 static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -731,6 +766,7 @@ static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct ublk_queue *ubq = hctx->driver_data;
 	struct request *rq = bd->rq;
 	struct ublk_io *io = &ubq->ios[rq->tag];
+	struct ublk_uring_cmd_pdu *pdu;
 	blk_status_t res;
 
 	/* fill iod to slot in io cmd buffer */
@@ -738,42 +774,33 @@ static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (unlikely(res != BLK_STS_OK))
 		return BLK_STS_IOERR;
 
-	blk_mq_start_request(bd->rq);
-
-	if (unlikely(ubq_daemon_is_dying(ubq))) {
- fail:
-		mod_delayed_work(system_wq, &ubq->dev->monitor_work, 0);
+	if (ubq->force_abort) {
+		pr_devel("%s: force abort: qid %d tag %d io_flag %d\n",
+				__func__, ubq->q_id, rq->tag, io->flags);
 		return BLK_STS_IOERR;
 	}
 
+	blk_mq_start_request(bd->rq);
+	pr_devel("%s: start req: cmd %px q_id %d tag %d io_flags %d\n",
+			__func__, io->cmd, ubq->q_id, rq->tag, io->flags);
+	pdu = ublk_get_uring_cmd_pdu(io->cmd);
+	pdu->q_id = ubq->q_id;
+	pdu->tag = rq->tag;
+
 	if (ublk_can_use_task_work(ubq)) {
-		struct ublk_rq_data *data = blk_mq_rq_to_pdu(rq);
 		enum task_work_notify_mode notify_mode = bd->last ?
 			TWA_SIGNAL_NO_IPI : TWA_NONE;
 
-		if (task_work_add(ubq->ubq_daemon, &data->work, notify_mode))
-			goto fail;
+		init_task_work(&pdu->work, ublk_rq_task_work_fn);
+
+		/* If task_work_add() fails, we know that ubq_daemon(cmd's task) is PF_EXITING. */
+		if (task_work_add(ubq->ubq_daemon, &pdu->work, notify_mode))
+			pr_devel("%s: task %px done old cmd: qid %d tag %d cmd %px\n",
+					__func__, current, ubq->q_id, rq->tag, io->cmd);
+			io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0);
+
 	} else {
-		struct io_uring_cmd *cmd = io->cmd;
-		struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
-
-		/*
-		 * If the check pass, we know that this is a re-issued request aborted
-		 * previously in monitor_work because the ubq_daemon(cmd's task) is
-		 * PF_EXITING. We cannot call io_uring_cmd_complete_in_task() anymore
-		 * because this ioucmd's io_uring context may be freed now if no inflight
-		 * ioucmd exists. Otherwise we may cause null-deref in ctx->fallback_work.
-		 *
-		 * Note: monitor_work sets UBLK_IO_FLAG_ABORTED and ends this request(releasing
-		 * the tag). Then the request is re-started(allocating the tag) and we are here.
-		 * Since releasing/allocating a tag implies smp_mb(), finding UBLK_IO_FLAG_ABORTED
-		 * guarantees that here is a re-issued request aborted previously.
-		 */
-		if ((io->flags & UBLK_IO_FLAG_ABORTED))
-			goto fail;
-
-		pdu->req = rq;
-		io_uring_cmd_complete_in_task(cmd, ublk_rq_task_work_cb);
+		io_uring_cmd_complete_in_task(io->cmd, ublk_rq_task_work_cb);
 	}
 
 	return BLK_STS_OK;
@@ -797,20 +824,10 @@ static int ublk_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
 	return 0;
 }
 
-static int ublk_init_rq(struct blk_mq_tag_set *set, struct request *req,
-		unsigned int hctx_idx, unsigned int numa_node)
-{
-	struct ublk_rq_data *data = blk_mq_rq_to_pdu(req);
-
-	init_task_work(&data->work, ublk_rq_task_work_fn);
-	return 0;
-}
-
 static const struct blk_mq_ops ublk_mq_ops = {
 	.queue_rq       = ublk_queue_rq,
 	.commit_rqs     = ublk_commit_rqs,
 	.init_hctx	= ublk_init_hctx,
-	.init_request   = ublk_init_rq,
 };
 
 static int ublk_ch_open(struct inode *inode, struct file *filp)
@@ -821,6 +838,7 @@ static int ublk_ch_open(struct inode *inode, struct file *filp)
 	if (test_and_set_bit(UB_STATE_OPEN, &ub->state))
 		return -EBUSY;
 	filp->private_data = ub;
+	pr_devel("%s: /dev/ublkc%d opened.\n", __func__, ub->dev_info.dev_id);
 	return 0;
 }
 
@@ -829,6 +847,7 @@ static int ublk_ch_release(struct inode *inode, struct file *filp)
 	struct ublk_device *ub = filp->private_data;
 
 	clear_bit(UB_STATE_OPEN, &ub->state);
+	pr_devel("%s: /dev/ublkc%d released.\n", __func__, ub->dev_info.dev_id);
 	return 0;
 }
 
@@ -889,31 +908,43 @@ static void ublk_commit_completion(struct ublk_device *ub,
 		ublk_complete_rq(req);
 }
 
-/*
- * When ->ubq_daemon is exiting, either new request is ended immediately,
- * or any queued io command is drained, so it is safe to abort queue
- * lockless
+/* do cleanup stuff for a dying(PF_EXITING) ubq_daemon:
+ * (1) fail all 'inflight' requests here.
+ * (2) done ioucmd of all not 'inflight' requests here.
+ * 
+ * Note: we have set ubq->force_abort before. So ublk_queue_rq() can fail
+ * a request immediately before it calls blk_mq_start_request() which will
+ * set a request's status as 'inflight'. Therefore, number of 'inflight'
+ * requests must not change for a ubq with a dying ubq_daemon.
+ * 
+ * Note: We avoid failing one request twice by failing it in ublk_queue_rq()
+ * before calling blk_mq_start_request() if 'force_abort' is set in advance.
+ * So its status is always 'idle' and never changes to 'inflight'.
  */
 static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
 {
 	int i;
 
+	WARN_ON_ONCE(!ubq->force_abort);
+
 	if (!ublk_get_device(ub))
 		return;
 
 	for (i = 0; i < ubq->q_depth; i++) {
-		struct ublk_io *io = &ubq->ios[i];
+		struct request *rq = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], i);
 
-		if (!(io->flags & UBLK_IO_FLAG_ACTIVE)) {
-			struct request *rq;
-
+		if (rq && blk_mq_request_started(rq)) {
 			/*
-			 * Either we fail the request or ublk_rq_task_work_fn
+			 * Either we fail the request or ublk_queue_rq
 			 * will do it
 			 */
-			rq = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], i);
-			if (rq)
-				__ublk_fail_req(io, rq);
+			pr_devel("%s: abort request: qid %d tag %d\n",
+					__func__, ubq->q_id, i);
+			blk_mq_end_request(rq, BLK_STS_IOERR);
+		} else {
+			pr_devel("%s: done old cmd: qid %d tag %d cmd %px\n",
+			__func__, ubq->q_id, i, ubq->ios[i].cmd);
+			io_uring_cmd_done(ubq->ios[i].cmd, UBLK_IO_RES_ABORT, 0);
 		}
 	}
 	ublk_put_device(ub);
@@ -928,10 +959,22 @@ static void ublk_daemon_monitor_work(struct work_struct *work)
 	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
 		struct ublk_queue *ubq = ublk_get_queue(ub, i);
 
-		if (ubq_daemon_is_dying(ubq)) {
+		/* check force_abort so we do not abort a queue two times! */
+		if (ubq->ubq_daemon && ubq_daemon_is_dying(ubq) && !ubq->force_abort) {
+			struct request_queue *q = ub->ub_disk->queue;
+
+			pr_devel("%s: find dying ubq_daemon: qid %d\n",
+					__func__, ubq->q_id);
+			ubq->force_abort = true;
+
+			/* ensure that all ublk_queue_rq() calls see force_abort */
+			if (blk_queue_has_srcu(q))
+				synchronize_srcu(q->srcu);
+			else
+				synchronize_rcu();
+
 			schedule_work(&ub->stop_work);
 
-			/* abort queue is for making forward progress */
 			ublk_abort_queue(ub, ubq);
 		}
 	}
@@ -956,18 +999,23 @@ static void ublk_cancel_queue(struct ublk_queue *ubq)
 {
 	int i;
 
-	if (!ublk_queue_ready(ubq))
+	if (!ubq->nr_io_ready)
 		return;
 
 	for (i = 0; i < ubq->q_depth; i++) {
 		struct ublk_io *io = &ubq->ios[i];
 
-		if (io->flags & UBLK_IO_FLAG_ACTIVE)
+		if (io->flags & UBLK_IO_FLAG_ACTIVE) {
+			pr_devel("%s: task %px done old cmd: qid %d tag %d cmd %px\n",
+					__func__, current, ubq->q_id, i, io->cmd);
 			io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0);
+			io->flags &= ~UBLK_IO_FLAG_ACTIVE;
+			ubq->nr_io_ready--;
+		}
 	}
 
 	/* all io commands are canceled */
-	ubq->nr_io_ready = 0;
+	WARN_ON_ONCE(ubq->nr_io_ready);
 }
 
 /* Cancel all pending commands, must be called after del_gendisk() returns */
@@ -975,25 +1023,54 @@ static void ublk_cancel_dev(struct ublk_device *ub)
 {
 	int i;
 
-	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
+		struct ublk_queue *ubq = ublk_get_queue(ub, i);
+
+		/*
+	 	 * for ubq with a dying daemon, we have io_uring_cmd_done() all cmd in
+	 	 * ublk_abort_queue(). Do not io_uring_cmd_done() cmd two times!
+	 	 */
+		if (ubq->ubq_daemon && ubq_daemon_is_dying(ubq))
+			continue;
+		
 		ublk_cancel_queue(ublk_get_queue(ub, i));
+	}
 }
 
 static void ublk_stop_dev(struct ublk_device *ub)
 {
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state != UBLK_S_DEV_LIVE)
-		goto unlock;
+	/* No gendisk is live. ubq may be ready or not */
+	if (ub->dev_info.state == UBLK_S_DEV_DEAD) {
+		goto out_cancel_dev;
 
-	del_gendisk(ub->ub_disk);
+	/*
+	 * We are after START_RECOVERY, so be careful to cleanup:
+	 *
+	 * (1) no dying ubq_daemon now.
+	 * (2) cannot call ublk_queue_rq() now.
+	 */
+	} else if (ub->dev_info.state == UBLK_S_DEV_RECOVERING) {
+		/* TODO: support stop_dev just after start_recovery */
+		goto out_unlock;
+	/* No START_RECOVERY yet, schedule monitor_work to abort any dying queue */
+	} else {
+		mod_delayed_work(system_wq, &ub->monitor_work, 0);
+	}
+
+	pr_devel("%s: waiting for all requests ended...\n", __func__);
+	blk_mq_freeze_queue(ub->ub_disk->queue);
 	ub->dev_info.state = UBLK_S_DEV_DEAD;
+	cancel_delayed_work_sync(&ub->monitor_work);
+	pr_devel("%s: all requests are ended.\n", __func__);
+	del_gendisk(ub->ub_disk);
 	ub->dev_info.ublksrv_pid = -1;
 	put_disk(ub->ub_disk);
 	ub->ub_disk = NULL;
- unlock:
+ out_cancel_dev:
 	ublk_cancel_dev(ub);
+ out_unlock:
 	mutex_unlock(&ub->mutex);
-	cancel_delayed_work_sync(&ub->monitor_work);
 }
 
 /* device can only be started after all IOs are ready */
@@ -1002,12 +1079,16 @@ static void ublk_mark_io_ready(struct ublk_device *ub, struct ublk_queue *ubq)
 	mutex_lock(&ub->mutex);
 	ubq->nr_io_ready++;
 	if (ublk_queue_ready(ubq)) {
+		pr_devel("%s: ubq %d ready\n", __func__, ubq->q_id);
 		ubq->ubq_daemon = current;
 		get_task_struct(ubq->ubq_daemon);
 		ub->nr_queues_ready++;
 	}
-	if (ub->nr_queues_ready == ub->dev_info.nr_hw_queues)
+	if (ub->nr_queues_ready == ub->dev_info.nr_hw_queues) {
+		pr_devel("%s: all queues(%d) ready\n",
+				__func__, ub->dev_info.nr_hw_queues);
 		complete_all(&ub->completion);
+	}
 	mutex_unlock(&ub->mutex);
 }
 
@@ -1015,17 +1096,17 @@ static void ublk_handle_need_get_data(struct ublk_device *ub, int q_id,
 		int tag, struct io_uring_cmd *cmd)
 {
 	struct ublk_queue *ubq = ublk_get_queue(ub, q_id);
-	struct request *req = blk_mq_tag_to_rq(ub->tag_set.tags[q_id], tag);
+	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
+
+	pdu->q_id = q_id;
+	pdu->tag = tag;
 
 	if (ublk_can_use_task_work(ubq)) {
-		struct ublk_rq_data *data = blk_mq_rq_to_pdu(req);
 
+		init_task_work(&pdu->work, ublk_rq_task_work_fn);
 		/* should not fail since we call it just in ubq->ubq_daemon */
-		task_work_add(ubq->ubq_daemon, &data->work, TWA_SIGNAL_NO_IPI);
+		task_work_add(ubq->ubq_daemon, &pdu->work, TWA_SIGNAL_NO_IPI);
 	} else {
-		struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
-
-		pdu->req = req;
 		io_uring_cmd_complete_in_task(cmd, ublk_rq_task_work_cb);
 	}
 }
@@ -1040,8 +1121,8 @@ static int ublk_ch_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	unsigned tag = ub_cmd->tag;
 	int ret = -EINVAL;
 
-	pr_devel("%s: received: cmd op %d queue %d tag %d result %d\n",
-			__func__, cmd->cmd_op, ub_cmd->q_id, tag,
+	pr_devel("%s: received: cmd %px, cmd op %d queue %d tag %d result %d\n",
+			__func__, cmd, cmd->cmd_op, ub_cmd->q_id, tag,
 			ub_cmd->result);
 
 	if (!(issue_flags & IO_URING_F_SQE128))
@@ -1124,8 +1205,8 @@ static int ublk_ch_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
  out:
 	io_uring_cmd_done(cmd, ret, 0);
-	pr_devel("%s: complete: cmd op %d, tag %d ret %x io_flags %x\n",
-			__func__, cmd_op, tag, ret, io->flags);
+	pr_devel("%s: complete: cmd %px cmd op %d, tag %d ret %x io_flags %x\n",
+			__func__, cmd, cmd_op, tag, ret, io->flags);
 	return -EIOCBQUEUED;
 }
 
@@ -1298,7 +1379,7 @@ static int ublk_add_tag_set(struct ublk_device *ub)
 	ub->tag_set.nr_hw_queues = ub->dev_info.nr_hw_queues;
 	ub->tag_set.queue_depth = ub->dev_info.queue_depth;
 	ub->tag_set.numa_node = NUMA_NO_NODE;
-	ub->tag_set.cmd_size = sizeof(struct ublk_rq_data);
+	ub->tag_set.cmd_size = 0;
 	ub->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
 	ub->tag_set.driver_data = ub;
 	return blk_mq_alloc_tag_set(&ub->tag_set);
@@ -1345,10 +1426,12 @@ static int ublk_ctrl_start_dev(struct io_uring_cmd *cmd)
 
 	wait_for_completion_interruptible(&ub->completion);
 
-	schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
+	if (!ublk_can_use_recovery(ub)) {
+		schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
+	}
 
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state == UBLK_S_DEV_LIVE ||
+	if (ub->dev_info.state != UBLK_S_DEV_DEAD ||
 	    test_bit(UB_STATE_USED, &ub->state)) {
 		ret = -EEXIST;
 		goto out_unlock;
@@ -1691,7 +1774,7 @@ static int ublk_ctrl_set_params(struct io_uring_cmd *cmd)
 
 	/* parameters can only be changed when device isn't live */
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state == UBLK_S_DEV_LIVE) {
+	if (ub->dev_info.state != UBLK_S_DEV_DEAD) {
 		ret = -EACCES;
 	} else if (copy_from_user(&ub->params, argp, ph.len)) {
 		ret = -EFAULT;
@@ -1703,6 +1786,183 @@ static int ublk_ctrl_set_params(struct io_uring_cmd *cmd)
 	mutex_unlock(&ub->mutex);
 	ublk_put_device(ub);
 
+	return ret;
+}
+
+/*
+ * reinit a ubq with a dying ubq_daemon for recovery. It must be called after ub is quiesced.
+ */
+static void ublk_reinit_queue_recovery(struct ublk_device *ub, struct ublk_queue *ubq)
+{
+	int i;
+
+	WARN_ON_ONCE(!(ubq->ubq_daemon && ubq_daemon_is_dying(ubq)));
+
+	pr_devel("%s: dying ubq_daemon: qid %d\n", __func__, ubq->q_id);
+
+	/* old daemon is PF_EXITING, put it now */
+	put_task_struct(ubq->ubq_daemon);
+	/* have to set it to NULL, otherwise ublk_ch_uring_cmd() won't accept new FETCH_REQ */
+	ubq->ubq_daemon = NULL;
+
+	for (i = 0; i < ubq->q_depth; i++) {
+		struct request *rq = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], i);
+		struct ublk_io *io = &ubq->ios[i];
+
+		if (rq && blk_mq_request_started(rq)) {
+			/* The request has been sent to ublksrv, and it is inflight. */
+			if (!(io->flags & UBLK_IO_FLAG_ACTIVE)) {
+				pr_devel("%s: %s req: qid %d tag %d io_flags %x\n",
+						__func__,
+						ublk_can_use_recovery_reissue(ub) ? "requeue" : "abort",
+						ubq->q_id, i, io->flags);
+				/* requeue rq but never call ublk_queue_rq() until the queue is unquiesced.*/
+				if (ublk_can_use_recovery_reissue(ub)) {
+						blk_mq_requeue_request(rq, false);
+						blk_mq_delay_kick_requeue_list(rq->q,
+								UBLK_REQUEUE_DELAY_MS);
+				/* abort this req */
+				} else {
+					/*
+					* Laterly, rq may be issued again but ublk_queue_rq()
+					* cannot be called until we unquiesce the queue.
+					*/
+					blk_mq_end_request(rq, BLK_STS_IOERR);
+				}
+			/* 
+			 * The request has not been sent to ublksrv, but it is inflight. So:
+			 *
+			 * (1) corresponding ublk_queue_rq() call happens after ubq_daemon is dying.
+			 *
+			 * (2) exit_task_work() runs task_work after ubq_daemon is dying; or
+			 *
+			 * (3) io_uring fallback_work is running in workqueue after ubq_daemon is dying.
+			 *
+			 * Therefore, we simply requeue the request.
+			 * 
+			 * Note:
+			 * (1) We do not io_uring_cmd_done() the old ioucmd here because (2) or (3)
+			 *     described above can do this.
+			 *
+			 * (2) We are safe to requeue rq since (2) or (3) only touches ioucmd(passed as
+			 *     an argument) first. Then they may detect that ubq_daemon is dying, return
+			 *     in advance and never touch rq(struct request), so no race on rq.
+			 *
+			 * (3) We requeue rq but ublk_queue_rq() is not called until the queue is unquiesced.
+			 */
+			} else {
+				pr_devel("%s: requeue req: qid %d tag %d io_flags %x\n",
+						__func__, ubq->q_id, i, io->flags);
+				blk_mq_requeue_request(rq, false);
+				blk_mq_delay_kick_requeue_list(rq->q,
+						UBLK_REQUEUE_DELAY_MS);
+			}
+		/*
+		 * No request has been issued(allocated) on this tag. We are safe to io_uring_cmd_done()
+		 * the old ioucmd because no one else can do this. Note that ublk_cancel_queue() calling
+		 * io_uring_cmd_done() must only be called with NOT dying ubq_daemon.
+		 */
+		} else {
+			pr_devel("%s: task %px done old cmd: qid %d tag %d cmd %px\n",
+					__func__, current, ubq->q_id, i, io->cmd);
+			io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0);
+		}
+
+		/* forget everything now and be ready for new FETCH_REQ */
+		io->flags = 0;
+		io->cmd = NULL;
+		io->addr = 0;
+		ubq->nr_io_ready--;
+	}
+
+	WARN_ON_ONCE(ubq->nr_io_ready);
+}
+
+static int ublk_ctrl_start_recovery(struct io_uring_cmd *cmd)
+{
+	struct ublksrv_ctrl_cmd *header = (struct ublksrv_ctrl_cmd *)cmd->cmd;
+	struct ublk_device *ub;
+	int ret = -EINVAL;
+	int i;
+	int ubq_need_recovery = 0;
+
+	ub = ublk_get_device_from_id(header->dev_id);
+	if (!ub)
+		return ret;
+
+	mutex_lock(&ub->mutex);
+
+	if (!ublk_can_use_recovery(ub))
+		goto out_unlock;
+
+	if (ub->dev_info.state != UBLK_S_DEV_LIVE) {
+		ret = -EBUSY;
+		goto out_unlock; 
+	}
+	
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
+		struct ublk_queue *ubq = ublk_get_queue(ub, i);
+
+		if (!(ubq->ubq_daemon && ubq_daemon_is_dying(ubq)))
+			continue;
+		
+		if (++ubq_need_recovery == 1) {
+			/* set to NULL, otherwise new ubq_daemon cannot mmap the io_cmd_buf */
+			ub->mm = NULL;
+			ub->dev_info.state = UBLK_S_DEV_RECOVERING;
+			blk_mq_quiesce_queue(ub->ub_disk->queue);
+			pr_devel("%s: queue quiesced.\n", __func__);
+			init_completion(&ub->completion);
+			ret = 0;
+		}
+		ublk_reinit_queue_recovery(ub, ubq);
+	}
+	pr_devel("%s: ubq_need_recovery: nr %d\n",
+			__func__, ubq_need_recovery);
+	WARN_ON(ubq_need_recovery > ub->nr_queues_ready);
+	ub->nr_queues_ready -= ubq_need_recovery;
+
+out_unlock:
+	mutex_unlock(&ub->mutex);
+	ublk_put_device(ub);
+	return ret;
+}
+
+static int ublk_ctrl_end_recovery(struct io_uring_cmd *cmd)
+{
+	struct ublksrv_ctrl_cmd *header = (struct ublksrv_ctrl_cmd *)cmd->cmd;
+	int ublksrv_pid = (int)header->data[0];
+	struct ublk_device *ub;
+	int ret = -EINVAL;
+
+	ub = ublk_get_device_from_id(header->dev_id);
+	if (!ub)
+		return ret;
+
+	pr_devel("%s: Waiting for new ubq_daemon is ready...\n", __func__);
+	/* wait until new ubq_daemon sending all FETCH_REQ */
+	wait_for_completion_interruptible(&ub->completion);
+	pr_devel("%s: All new ubq_daemon is ready.\n", __func__);
+
+	mutex_lock(&ub->mutex);
+	
+	if (!ublk_can_use_recovery(ub))
+		goto out_unlock;
+
+	if (ub->dev_info.state != UBLK_S_DEV_RECOVERING) {
+		ret = -EBUSY;
+		goto out_unlock; 
+	}
+	ub->dev_info.ublksrv_pid = ublksrv_pid;
+	pr_devel("%s: new ublksrv_pid %d\n", __func__,
+			ub->dev_info.ublksrv_pid);
+	blk_mq_unquiesce_queue(ub->ub_disk->queue);
+	pr_devel("%s: queue unquiesced.\n", __func__);
+	ub->dev_info.state = UBLK_S_DEV_LIVE;
+	ret = 0;
+out_unlock:
+	mutex_unlock(&ub->mutex);
+	ublk_put_device(ub);
 	return ret;
 }
 
@@ -1746,6 +2006,12 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 		break;
 	case UBLK_CMD_SET_PARAMS:
 		ret = ublk_ctrl_set_params(cmd);
+		break;
+	case UBLK_CMD_START_USER_RECOVERY:
+		ret = ublk_ctrl_start_recovery(cmd);
+		break;
+	case UBLK_CMD_END_USER_RECOVERY:
+		ret = ublk_ctrl_end_recovery(cmd);
 		break;
 	default:
 		break;
