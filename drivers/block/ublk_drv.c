@@ -345,7 +345,8 @@ static inline bool ublk_can_use_recovery_reissue(struct ublk_device *ub)
 {
 	struct ublk_queue *ubq = ublk_get_queue(ub, 0);
 
-	if (ubq->flags & (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE))
+	if ((ubq->flags & UBLK_F_USER_RECOVERY) &&
+			(ubq->flags & UBLK_F_USER_RECOVERY_REISSUE))
 		return true;
 	return false;
 }
