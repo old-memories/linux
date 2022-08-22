@@ -1018,18 +1018,23 @@ static void ublk_cancel_dev(struct ublk_device *ub)
 static void ublk_stop_dev(struct ublk_device *ub)
 {
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state != UBLK_S_DEV_LIVE)
-		goto unlock;
+	/* No gendisk is live. ubq may be ready or not */
+	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
+		goto out_cancel_dev;
 
-	del_gendisk(ub->ub_disk);
+	mod_delayed_work(system_wq, &ub->monitor_work, 0);
+	pr_devel("%s: Wait for all requests ended...\n", __func__);
+	blk_mq_freeze_queue(ub->ub_disk->queue);
 	ub->dev_info.state = UBLK_S_DEV_DEAD;
+	cancel_delayed_work_sync(&ub->monitor_work);
+	pr_devel("%s: All requests are ended.\n", __func__);
+	del_gendisk(ub->ub_disk);
 	ub->dev_info.ublksrv_pid = -1;
 	put_disk(ub->ub_disk);
 	ub->ub_disk = NULL;
- unlock:
+ out_cancel_dev:
 	ublk_cancel_dev(ub);
 	mutex_unlock(&ub->mutex);
-	cancel_delayed_work_sync(&ub->monitor_work);
 }
 
 /* device can only be started after all IOs are ready */
