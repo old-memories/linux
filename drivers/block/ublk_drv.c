@@ -1435,7 +1435,8 @@ static int ublk_ctrl_start_dev(struct io_uring_cmd *cmd)
 
 	wait_for_completion_interruptible(&ub->completion);
 
-	schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
+	if (!ublk_can_use_recovery(ub))
+		schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
 
 	mutex_lock(&ub->mutex);
 	if (ub->dev_info.state != UBLK_S_DEV_DEAD ||
