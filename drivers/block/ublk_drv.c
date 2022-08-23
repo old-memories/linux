@@ -49,7 +49,9 @@
 /* All UBLK_F_* have to be included into UBLK_F_ALL */
 #define UBLK_F_ALL (UBLK_F_SUPPORT_ZERO_COPY \
 		| UBLK_F_URING_CMD_COMP_IN_TASK \
-		| UBLK_F_NEED_GET_DATA)
+		| UBLK_F_NEED_GET_DATA \
+		| UBLK_F_USER_RECOVERY \
+		| UBLK_F_USER_RECOVERY_REISSUE)
 
 /* All UBLK_PARAM_TYPE_* should be included here */
 #define UBLK_PARAM_TYPE_ALL (UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD)
@@ -320,6 +322,33 @@ static inline int ublk_queue_cmd_buf_size(struct ublk_device *ub, int q_id)
 
 	return round_up(ubq->q_depth * sizeof(struct ublksrv_io_desc),
 			PAGE_SIZE);
+}
+
+/*
+ * TODO: UBLK_F_USER_RECOVERY should be a flag for device, not for queue,
+ * since "some queues are aborted while others are recovered" is really weird.
+ */
+static inline bool ublk_can_use_recovery(struct ublk_device *ub)
+{
+	struct ublk_queue *ubq = ublk_get_queue(ub, 0);
+
+	if (ubq->flags & UBLK_F_USER_RECOVERY)
+		return true;
+	return false;
+}
+
+/*
+ * TODO: UBLK_F_USER_RECOVERY_REISSUE should be a flag for device, not for queue,
+ * since "some queues are aborted while others are recovered" is really weird.
+ */
+static inline bool ublk_can_use_recovery_reissue(struct ublk_device *ub)
+{
+	struct ublk_queue *ubq = ublk_get_queue(ub, 0);
+
+	if ((ubq->flags & UBLK_F_USER_RECOVERY) &&
+			(ubq->flags & UBLK_F_USER_RECOVERY_REISSUE))
+		return true;
+	return false;
 }
 
 static void ublk_free_disk(struct gendisk *disk)
@@ -1029,10 +1058,15 @@ static void ublk_stop_dev(struct ublk_device *ub)
 {
 	mutex_lock(&ub->mutex);
 	/* No gendisk is live. ubq may be ready or not */
-	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
+	if (ub->dev_info.state == UBLK_S_DEV_DEAD) {
 		goto out_cancel_dev;
-
-	mod_delayed_work(system_wq, &ub->monitor_work, 0);
+	/* TODO: support stop_dev just after start_recovery */
+	} else if (ub->dev_info.state == UBLK_S_DEV_RECOVERING) {
+		goto out_unlock;
+	/* schedule monitor_work to abort any dying queue */
+	} else {
+		mod_delayed_work(system_wq, &ub->monitor_work, 0);
+	}
 	pr_devel("%s: Wait for all requests ended...\n", __func__);
 	blk_mq_freeze_queue(ub->ub_disk->queue);
 	ub->dev_info.state = UBLK_S_DEV_DEAD;
@@ -1044,6 +1078,7 @@ static void ublk_stop_dev(struct ublk_device *ub)
 	ub->ub_disk = NULL;
  out_cancel_dev:
 	ublk_cancel_dev(ub);
+ out_unlock:
 	mutex_unlock(&ub->mutex);
 }
 
@@ -1403,7 +1438,7 @@ static int ublk_ctrl_start_dev(struct io_uring_cmd *cmd)
 	schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
 
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state == UBLK_S_DEV_LIVE ||
+	if (ub->dev_info.state != UBLK_S_DEV_DEAD ||
 	    test_bit(UB_STATE_USED, &ub->state)) {
 		ret = -EEXIST;
 		goto out_unlock;
@@ -1746,7 +1781,7 @@ static int ublk_ctrl_set_params(struct io_uring_cmd *cmd)
 
 	/* parameters can only be changed when device isn't live */
 	mutex_lock(&ub->mutex);
-	if (ub->dev_info.state == UBLK_S_DEV_LIVE) {
+	if (ub->dev_info.state != UBLK_S_DEV_DEAD) {
 		ret = -EACCES;
 	} else if (copy_from_user(&ub->params, argp, ph.len)) {
 		ret = -EFAULT;
