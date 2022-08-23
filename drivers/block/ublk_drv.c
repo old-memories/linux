@@ -555,6 +555,12 @@ static inline struct ublk_uring_cmd_pdu *ublk_get_uring_cmd_pdu(
 	return (struct ublk_uring_cmd_pdu *)&ioucmd->pdu;
 }
 
+static inline struct io_uring_cmd *ublk_uring_cmd_from_pdu(
+			struct ublk_uring_cmd_pdu *pdu)
+{
+	return container_of((u8 *)pdu, struct io_uring_cmd, pdu[0]);
+}
+
 static inline bool ubq_daemon_is_dying(struct ublk_queue *ubq)
 {
 	return ubq->ubq_daemon->flags & PF_EXITING;
