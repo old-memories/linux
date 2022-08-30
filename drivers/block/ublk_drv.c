@@ -689,7 +689,16 @@ static inline void __ublk_rq_task_work(struct request *req)
 	 * (2) current->flags & PF_EXITING.
 	 */
 	if (unlikely(current != ubq->ubq_daemon || current->flags & PF_EXITING)) {
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		pr_devel("%s: %s q_id %d tag %d io_flags %x.\n", __func__,
+				(ublk_can_use_recovery(ub)) ? "requeue" : "abort",
+				ubq->q_id, req->tag, io->flags);
+	
+		if (ublk_can_use_recovery(ub)) {
+			/* We cannot process this req so just requeue it. */
+			blk_mq_requeue_request(req, false);
+		} else {
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		mod_delayed_work(system_wq, &ub->monitor_work, 0);
 		return;
 	}
@@ -769,6 +778,7 @@ static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
 {
 	struct ublk_queue *ubq = hctx->driver_data;
 	struct request *rq = bd->rq;
+	struct ublk_io *io = &ubq->ios[rq->tag];
 	blk_status_t res;
 
 	/* fill iod to slot in io cmd buffer */
@@ -780,8 +790,18 @@ static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	if (unlikely(ubq_daemon_is_dying(ubq))) {
  fail:
+		pr_devel("%s: %s q_id %d tag %d io_flags %x.\n", __func__,
+				(ublk_can_use_recovery(ubq->dev)) ? "requeue" : "abort",
+				ubq->q_id, rq->tag, io->flags);
+
 		mod_delayed_work(system_wq, &ubq->dev->monitor_work, 0);
-		return BLK_STS_IOERR;
+		if (ublk_can_use_recovery(ubq->dev)) {
+			/* We cannot process this rq so just requeue it. */
+			blk_mq_requeue_request(rq, false);
+			return BLK_STS_OK;
+		} else {
+			return BLK_STS_IOERR;
+		}
 	}
 
 	if (ublk_can_use_task_work(ubq)) {
@@ -792,7 +812,6 @@ static blk_status_t ublk_queue_rq(struct blk_mq_hw_ctx *hctx,
 		if (task_work_add(ubq->ubq_daemon, &data->work, notify_mode))
 			goto fail;
 	} else {
-		struct ublk_io *io = &ubq->ios[rq->tag];
 		struct io_uring_cmd *cmd = io->cmd;
 		struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
 
