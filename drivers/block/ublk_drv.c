@@ -963,22 +963,39 @@ static inline bool ublk_queue_ready(struct ublk_queue *ubq)
 	return ubq->nr_io_ready == ubq->q_depth;
 }
 
+/* If ublk_cancel_queue() is called before sending START_DEV(), ->mutex
+ * provides protection on above update.
+ *
+ * If ublk_cancel_queue() is called after sending START_DEV(), disk is
+ * deleted first, UBLK_IO_RES_ABORT is returned so that any new io
+ * command can't be issued to driver, so updating on io flags and
+ * nr_io_ready is safe here.
+ *
+ * Also ->nr_io_ready is guaranteed to become zero after ublk_cance_queue()
+ * returns since request queue is either frozen or not present in both two
+ * cases.
+ */
 static void ublk_cancel_queue(struct ublk_queue *ubq)
 {
 	int i;
 
-	if (!ublk_queue_ready(ubq))
+	if (!ubq->nr_io_ready)
 		return;
 
 	for (i = 0; i < ubq->q_depth; i++) {
 		struct ublk_io *io = &ubq->ios[i];
 
-		if (io->flags & UBLK_IO_FLAG_ACTIVE)
+		if (io->flags & UBLK_IO_FLAG_ACTIVE) {
+			pr_devel("%s: done old cmd: qid %d tag %d\n",
+					__func__, ubq->q_id, i);
 			io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0);
+			io->flags &= ~UBLK_IO_FLAG_ACTIVE;
+			ubq->nr_io_ready--;
+		}
 	}
 
 	/* all io commands are canceled */
-	ubq->nr_io_ready = 0;
+	WARN_ON_ONCE(ubq->nr_io_ready);
 }
 
 /* Cancel all pending commands, must be called after del_gendisk() returns */
