@@ -1143,10 +1143,13 @@ static void ublk_daemon_monitor_work(struct work_struct *work)
 	/*
 	 * We can't schedule monitor work after ublk_remove() is started.
 	 *
-	 * No need ub->mutex, monitor work are canceled after state is marked
-	 * as DEAD, so DEAD state is observed reliably.
+	 * We can't schedule monitor work after ub is QUIESCED because
+	 * ubq_daemon may be NULL during user recovery.
+	 *
+	 * No need ub->mutex, monitor work are canceled after state is not
+	 * UBLK_S_DEV_LIVE, so new state is observed reliably.
 	 */
-	if (ub->dev_info.state != UBLK_S_DEV_DEAD)
+	if (ub->dev_info.state == UBLK_S_DEV_LIVE)
 		schedule_delayed_work(&ub->monitor_work,
 				UBLK_DAEMON_MONITOR_PERIOD);
 }
@@ -2016,6 +2019,7 @@ static int ublk_ctrl_start_recovery(struct io_uring_cmd *cmd)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+	cancel_delayed_work_sync(&ub->monitor_work);
 	pr_devel("%s: start recovery for dev id %d.\n", __func__, header->dev_id);
 	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
 		ublk_queue_reinit(ub, ublk_get_queue(ub, i));
@@ -2064,6 +2068,7 @@ static int ublk_ctrl_end_recovery(struct io_uring_cmd *cmd)
 			__func__, header->dev_id);
 	blk_mq_kick_requeue_list(ub->ub_disk->queue);
 	ub->dev_info.state = UBLK_S_DEV_LIVE;
+	schedule_delayed_work(&ub->monitor_work, UBLK_DAEMON_MONITOR_PERIOD);
 	ret = 0;
  out_unlock:
 	mutex_unlock(&ub->mutex);
