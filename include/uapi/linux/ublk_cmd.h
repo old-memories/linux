@@ -17,6 +17,7 @@
 #define	UBLK_CMD_STOP_DEV	0x07
 #define	UBLK_CMD_SET_PARAMS	0x08
 #define	UBLK_CMD_GET_PARAMS	0x09
+#define UBLK_CMD_RECOVER_DEV	0x10
 
 /*
  * IO commands, issued by ublk server, and handled by ublk driver.
