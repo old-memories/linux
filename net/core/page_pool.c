@@ -342,19 +342,47 @@ static void page_pool_clear_pp_info(struct page *page)
 	page->pp = NULL;
 }
 
+/* hooks to either page provider or system page allocator */
+static void page_pool_mm_put_page(struct page_pool *pool, struct page *page)
+{
+	if (pool->p.put_page)
+		return pool->p.put_page(pool->p.init_arg, page);
+	put_page(page);
+}
+
+static unsigned long page_pool_mm_alloc_bulk(struct page_pool *pool,
+					     gfp_t gfp,
+					     unsigned long nr_pages)
+{
+	if (pool->p.alloc_bulk)
+		return pool->p.alloc_bulk(pool->p.init_arg, gfp,
+					  pool->p.nid, nr_pages,
+					  pool->alloc.cache);
+	return alloc_pages_bulk_array_node(gfp, pool->p.nid,
+					   nr_pages, pool->alloc.cache);
+}
+
+static struct page *page_pool_mm_alloc(struct page_pool *pool, gfp_t gfp)
+{
+	if (pool->p.alloc_pages)
+		return pool->p.alloc_pages(pool->p.init_arg, pool->p.nid,
+					   gfp, pool->p.order);
+	return alloc_pages_node(pool->p.nid, gfp, pool->p.order);
+}
+
 static struct page *__page_pool_alloc_page_order(struct page_pool *pool,
 						 gfp_t gfp)
 {
 	struct page *page;
 
 	gfp |= __GFP_COMP;
-	page = alloc_pages_node(pool->p.nid, gfp, pool->p.order);
+	page = page_pool_mm_alloc(pool, gfp);
 	if (unlikely(!page))
 		return NULL;
 
 	if ((pool->p.flags & PP_FLAG_DMA_MAP) &&
 	    unlikely(!page_pool_dma_map(pool, page))) {
-		put_page(page);
+		page_pool_mm_put_page(pool, page);
 		return NULL;
 	}
 
@@ -389,8 +417,7 @@ static struct page *__page_pool_alloc_pages_slow(struct page_pool *pool,
 	/* Mark empty alloc.cache slots "empty" for alloc_pages_bulk_array */
 	memset(&pool->alloc.cache, 0, sizeof(void *) * bulk);
 
-	nr_pages = alloc_pages_bulk_array_node(gfp, pool->p.nid, bulk,
-					       pool->alloc.cache);
+	nr_pages = page_pool_mm_alloc_bulk(pool, gfp, bulk);
 	if (unlikely(!nr_pages))
 		return NULL;
 
@@ -401,7 +428,7 @@ static struct page *__page_pool_alloc_pages_slow(struct page_pool *pool,
 		page = pool->alloc.cache[i];
 		if ((pp_flags & PP_FLAG_DMA_MAP) &&
 		    unlikely(!page_pool_dma_map(pool, page))) {
-			put_page(page);
+			page_pool_mm_put_page(pool, page);
 			continue;
 		}
 
@@ -501,7 +528,7 @@ static void page_pool_return_page(struct page_pool *pool, struct page *page)
 {
 	page_pool_release_page(pool, page);
 
-	put_page(page);
+	page_pool_mm_put_page(pool, page);
 	/* An optimization would be to call __free_pages(page, pool->p.order)
 	 * knowing page is not part of page-cache (thus avoiding a
 	 * __page_cache_release() call).
@@ -593,7 +620,7 @@ __page_pool_put_page(struct page_pool *pool, struct page *page,
 	recycle_stat_inc(pool, released_refcnt);
 	/* Do not replace this with page_pool_return_page() */
 	page_pool_release_page(pool, page);
-	put_page(page);
+	page_pool_mm_put_page(pool, page);
 
 	return NULL;
 }

@@ -82,6 +82,12 @@ struct page_pool_params {
 	unsigned int	offset;  /* DMA addr offset */
 	void (*init_callback)(struct page *page, void *arg);
 	void *init_arg;
+	struct page *(*alloc_pages)(void *arg, int nid, gfp_t gfp,
+				    unsigned int order);
+	unsigned long (*alloc_bulk)(void *arg, gfp_t gfp, int nid,
+				    unsigned long nr_pages,
+				    struct page **page_array);
+	void (*put_page)(void *arg, struct page *page);
 };
 
 #ifdef CONFIG_PAGE_POOL_STATS
