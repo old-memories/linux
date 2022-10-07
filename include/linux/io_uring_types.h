@@ -323,6 +323,7 @@ struct io_ring_ctx {
 	struct io_mapped_ubuf		*dummy_ubuf;
 	struct io_rsrc_data		*file_data;
 	struct io_rsrc_data		*buf_data;
+	struct xarray			zctap_ifq_xa;
 
 	struct delayed_work		rsrc_put_work;
 	struct llist_head		rsrc_put_llist;
@@ -576,6 +577,14 @@ struct io_kiocb {
 struct io_overflow_cqe {
 	struct list_head list;
 	struct io_uring_cqe cqe;
+};
+
+struct io_zctap_ifq {
+	struct net_device	*dev;
+	struct io_ring_ctx	*ctx;
+	u16			queue_id;
+	u16			id;
+	u16			fill_bgid;
 };
 
 #endif
