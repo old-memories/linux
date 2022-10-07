@@ -473,6 +473,9 @@ enum {
 	/* register a range of fixed file slots for automatic slot allocation */
 	IORING_REGISTER_FILE_ALLOC_RANGE	= 25,
 
+	/* register a network ifq for zerocopy RX */
+	IORING_REGISTER_IFQ			= 26,
+
 	/* this goes last */
 	IORING_REGISTER_LAST
 };
@@ -647,6 +650,17 @@ struct io_uring_recvmsg_out {
 	__u32 controllen;
 	__u32 payloadlen;
 	__u32 flags;
+};
+
+/*
+ * Argument for IORING_REGISTER_IFQ
+ */
+struct io_uring_ifq_req {
+	__u32	ifindex;
+	__u16	queue_id;
+	__u16	ifq_id;
+	__u16	fill_bgid;
+	__u16	__pad[3];
 };
 
 #ifdef __cplusplus

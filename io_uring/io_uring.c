@@ -91,6 +91,7 @@
 #include "cancel.h"
 #include "net.h"
 #include "notif.h"
+#include "zctap.h"
 
 #include "timeout.h"
 #include "poll.h"
@@ -321,6 +322,7 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	INIT_WQ_LIST(&ctx->locked_free_list);
 	INIT_DELAYED_WORK(&ctx->fallback_work, io_fallback_req_func);
 	INIT_WQ_LIST(&ctx->submit_state.compl_reqs);
+	xa_init(&ctx->zctap_ifq_xa);
 	return ctx;
 err:
 	kfree(ctx->dummy_ubuf);
@@ -2639,6 +2641,8 @@ static __cold void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 		__io_cqring_overflow_flush(ctx, true);
 	xa_for_each(&ctx->personalities, index, creds)
 		io_unregister_personality(ctx, index);
+	xa_for_each(&ctx->zctap_ifq_xa, index, creds)
+		io_unregister_zctap_ifq(ctx, index);
 	if (ctx->rings)
 		io_poll_remove_all(ctx, NULL, true);
 	mutex_unlock(&ctx->uring_lock);
@@ -3848,6 +3852,12 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		if (!arg || nr_args)
 			break;
 		ret = io_register_file_alloc_range(ctx, arg);
+		break;
+	case IORING_REGISTER_IFQ:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_register_ifq(ctx, arg);
 		break;
 	default:
 		ret = -EINVAL;
