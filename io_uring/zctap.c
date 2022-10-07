@@ -183,8 +183,35 @@ struct ifq_region {
 	int			count;
 	int			imu_idx;
 	int			nr_pages;
+	u8			*page_uref;
 	struct page		*page[];
 };
+
+static void io_add_page_uref(struct ifq_region *ifr, u16 pgid)
+{
+	if (WARN_ON(!ifr))
+		return;
+
+	if (WARN_ON(pgid < ifr->imu_idx))
+		return;
+
+	ifr->page_uref[pgid - ifr->imu_idx]++;
+}
+
+static bool io_put_page_last_uref(struct ifq_region *ifr, u64 addr)
+{
+	int idx;
+
+	if (WARN_ON(addr < ifr->start || addr > ifr->end))
+		return false;
+
+	idx = (addr - ifr->start) >> PAGE_SHIFT;
+
+	if (WARN_ON(!ifr->page_uref[idx]))
+		return false;
+
+	return --ifr->page_uref[idx] == 0;
+}
 
 int io_provide_ifq_region_prep(struct io_kiocb *req,
 			       const struct io_uring_sqe *sqe)
@@ -244,6 +271,11 @@ int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags)
 	if (!ifr)
 		return -ENOMEM;
 
+	ifr->page_uref = kvmalloc_array(nr_pages, sizeof(u8), GFP_KERNEL);
+	if (!ifr->page_uref) {
+		kvfree(ifr);
+		return -ENOMEM;
+	}
 
 	ifr->nr_pages = nr_pages;
 	ifr->imu_idx = idx;
@@ -261,6 +293,7 @@ int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags)
 		info = zctap_page_info(r->bgid, idx + i, id);
 		set_page_private(page, info);
 		ifr->page[i] = page;
+		ifr->page_uref[i] = 0;
 	}
 
 	WRITE_ONCE(r->ifq->region,  ifr);
@@ -273,6 +306,7 @@ out:
 		set_page_private(page, 0);
 	}
 
+	kvfree(ifr->page_uref);
 	kvfree(ifr);
 
 	return -EEXIST;
