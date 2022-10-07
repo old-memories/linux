@@ -19,6 +19,26 @@ static DEFINE_XARRAY_ALLOC1(io_zctap_ifq_xa);
 
 typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
 
+static u64 zctap_page_info(u16 region_id, u16 pgid, u16 ifq_id)
+{
+	return (u64)region_id << 32 | (u64)pgid << 16 | ifq_id;
+}
+
+static u16 zctap_page_region_id(const struct page *page)
+{
+	return (page_private(page) >> 32) & 0xffff;
+}
+
+static u16 zctap_page_id(const struct page *page)
+{
+	return (page_private(page) >> 16) & 0xffff;
+}
+
+static u16 zctap_page_ifq_id(const struct page *page)
+{
+	return page_private(page) & 0xffff;
+}
+
 static int __io_queue_mgmt(struct net_device *dev, struct io_zctap_ifq *ifq,
 			   u16 *queue_id)
 {
@@ -213,8 +233,9 @@ int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_ifq_region *r = io_kiocb_to_cmd(req, struct io_ifq_region);
 	struct ifq_region *ifr;
-	int i, idx, nr_pages;
+	int i, id, idx, nr_pages;
 	struct page *page;
+	u64 info;
 
 	nr_pages = r->len >> PAGE_SHIFT;
 	idx = (r->addr - req->imu->ubuf) >> PAGE_SHIFT;
@@ -231,12 +252,28 @@ int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags)
 	ifr->start = r->addr;
 	ifr->end = r->addr + r->len;
 
+	id = r->ifq->id;
 	for (i = 0; i < nr_pages; i++, idx++) {
 		page = req->imu->bvec[idx].bv_page;
+		if (PagePrivate(page))
+			goto out;
+		SetPagePrivate(page);
+		info = zctap_page_info(r->bgid, idx + i, id);
+		set_page_private(page, info);
 		ifr->page[i] = page;
 	}
 
 	WRITE_ONCE(r->ifq->region,  ifr);
 
 	return 0;
+out:
+	while (i--) {
+		page = req->imu->bvec[idx + i].bv_page;
+		ClearPagePrivate(page);
+		set_page_private(page, 0);
+	}
+
+	kvfree(ifr);
+
+	return -EEXIST;
 }

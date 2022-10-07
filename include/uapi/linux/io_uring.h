@@ -664,6 +664,16 @@ struct io_uring_ifq_req {
 	__u16	__pad[3];
 };
 
+struct io_uring_zctap_iov {
+	__u32	off;
+	__u32	len;
+	__u16	bgid;
+	__u16	bid;
+	__u16	ifq_id;
+	__u16	resv;
+};
+
+
 #ifdef __cplusplus
 }
 #endif
