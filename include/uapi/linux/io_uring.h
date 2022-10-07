@@ -206,6 +206,7 @@ enum io_uring_op {
 	IORING_OP_SOCKET,
 	IORING_OP_URING_CMD,
 	IORING_OP_SEND_ZC,
+	IORING_OP_PROVIDE_IFQ_REGION,
 
 	/* this goes last, obviously */
 	IORING_OP_LAST,

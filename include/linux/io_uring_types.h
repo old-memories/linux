@@ -582,6 +582,7 @@ struct io_overflow_cqe {
 struct io_zctap_ifq {
 	struct net_device	*dev;
 	struct io_ring_ctx	*ctx;
+	void			*region;	/* XXX relocate? */
 	u16			queue_id;
 	u16			id;
 	u16			fill_bgid;

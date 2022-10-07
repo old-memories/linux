@@ -33,6 +33,7 @@
 #include "poll.h"
 #include "cancel.h"
 #include "rw.h"
+#include "zctap.h"
 
 static int io_no_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
@@ -487,6 +488,14 @@ const struct io_op_def io_op_defs[] = {
 #else
 		.prep			= io_eopnotsupp_prep,
 #endif
+	},
+	[IORING_OP_PROVIDE_IFQ_REGION] = {
+		.audit_skip		= 1,
+		.iopoll			= 1,
+		.buffer_select		= 1,
+		.name			= "PROVIDE_IFQ_REGION",
+		.prep			= io_provide_ifq_region_prep,
+		.issue			= io_provide_ifq_region,
 	},
 };
 

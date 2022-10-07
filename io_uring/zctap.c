@@ -6,11 +6,14 @@
 #include <linux/mm.h>
 #include <linux/io_uring.h>
 #include <linux/netdevice.h>
+#include <linux/nospec.h>
 
 #include <uapi/linux/io_uring.h>
 
 #include "io_uring.h"
 #include "zctap.h"
+#include "rsrc.h"
+#include "kbuf.h"
 
 static DEFINE_XARRAY_ALLOC1(io_zctap_ifq_xa);
 
@@ -143,4 +146,97 @@ int io_unregister_ifq(struct io_ring_ctx *ctx,
 		return -EFAULT;
 
 	return io_unregister_zctap_ifq(ctx, req.ifq_id);
+}
+
+struct io_ifq_region {
+	struct file		*file;
+	struct io_zctap_ifq	*ifq;
+	__u64			addr;
+	__u32			len;
+	__u32			bgid;
+};
+
+struct ifq_region {
+	struct io_mapped_ubuf	*imu;
+	u64			start;
+	u64			end;
+	int			count;
+	int			imu_idx;
+	int			nr_pages;
+	struct page		*page[];
+};
+
+int io_provide_ifq_region_prep(struct io_kiocb *req,
+			       const struct io_uring_sqe *sqe)
+{
+	struct io_ifq_region *r = io_kiocb_to_cmd(req, struct io_ifq_region);
+	struct io_ring_ctx *ctx = req->ctx;
+	struct io_mapped_ubuf *imu;
+	u32 index;
+
+	if (!(req->flags & REQ_F_BUFFER_SELECT))
+		return -EINVAL;
+
+	r->addr = READ_ONCE(sqe->addr);
+	r->len = READ_ONCE(sqe->len);
+	index = READ_ONCE(sqe->fd);
+
+	if (!r->addr || r->addr & ~PAGE_MASK)
+		return -EFAULT;
+
+	if (!r->len || r->len & ~PAGE_MASK)
+		return -EFAULT;
+
+	r->ifq = xa_load(&ctx->zctap_ifq_xa, index);
+	if (!r->ifq)
+		return -EFAULT;
+
+	/* XXX for now, only allow one region per ifq. */
+	if (r->ifq->region)
+		return -EFAULT;
+
+	if (unlikely(req->buf_index >= ctx->nr_user_bufs))
+		return -EFAULT;
+	index = array_index_nospec(req->buf_index, ctx->nr_user_bufs);
+	imu = ctx->user_bufs[index];
+
+	if (r->addr < imu->ubuf || r->addr + r->len > imu->ubuf_end)
+		return -EFAULT;
+	req->imu = imu;
+
+	io_req_set_rsrc_node(req, ctx, 0);
+
+	return 0;
+}
+
+int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags)
+{
+	struct io_ifq_region *r = io_kiocb_to_cmd(req, struct io_ifq_region);
+	struct ifq_region *ifr;
+	int i, idx, nr_pages;
+	struct page *page;
+
+	nr_pages = r->len >> PAGE_SHIFT;
+	idx = (r->addr - req->imu->ubuf) >> PAGE_SHIFT;
+
+	ifr = kvmalloc(struct_size(ifr, page, nr_pages), GFP_KERNEL);
+	if (!ifr)
+		return -ENOMEM;
+
+
+	ifr->nr_pages = nr_pages;
+	ifr->imu_idx = idx;
+	ifr->count = nr_pages;
+	ifr->imu = req->imu;
+	ifr->start = r->addr;
+	ifr->end = r->addr + r->len;
+
+	for (i = 0; i < nr_pages; i++, idx++) {
+		page = req->imu->bvec[idx].bv_page;
+		ifr->page[i] = page;
+	}
+
+	WRITE_ONCE(r->ifq->region,  ifr);
+
+	return 0;
 }
