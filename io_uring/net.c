@@ -16,6 +16,7 @@
 #include "net.h"
 #include "notif.h"
 #include "rsrc.h"
+#include "zctap.h"
 
 #if defined(CONFIG_NET)
 struct io_shutdown {
@@ -71,6 +72,14 @@ struct io_sendzc {
 	void __user			*addr;
 	size_t				done_io;
 	struct io_kiocb 		*notif;
+};
+
+struct io_recvzc {
+	struct io_sr_msg		sr;
+	struct io_zctap_ifq		*ifq;
+	u32				datalen;
+	u16				ifq_id;
+	u16				copy_bgid;
 };
 
 #define IO_APOLL_MULTI_POLLED (REQ_F_APOLL_MULTISHOT | REQ_F_POLLED)
@@ -866,6 +875,120 @@ out_free:
 		ret += sr->done_io;
 	else if (sr->done_io)
 		ret = sr->done_io;
+	else
+		io_kbuf_recycle(req, issue_flags);
+
+	cflags = io_put_kbuf(req, issue_flags);
+	if (msg.msg_inq)
+		cflags |= IORING_CQE_F_SOCK_NONEMPTY;
+
+	if (!io_recv_finish(req, &ret, cflags, ret <= 0))
+		goto retry_multishot;
+
+	return ret;
+}
+
+int io_recvzc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+{
+	struct io_recvzc *zc = io_kiocb_to_cmd(req, struct io_recvzc);
+	u64 recvzc_cmd;
+	u16 ifq_id;
+
+	/* XXX hack so we can temporarily use io_recvmsg_prep */
+	recvzc_cmd = READ_ONCE(sqe->addr3);
+
+	ifq_id = recvzc_cmd & 0xffff;
+	zc->copy_bgid = (recvzc_cmd >> 16) & 0xffff;
+	zc->datalen = recvzc_cmd >> 32;
+
+	zc->ifq = xa_load(&req->ctx->zctap_ifq_xa, ifq_id);
+	if (!zc->ifq)
+		return -EINVAL;
+	if (zc->ifq->ctx != req->ctx)
+		return -EINVAL;
+
+	return io_recvmsg_prep(req, sqe);
+}
+
+int io_recvzc(struct io_kiocb *req, unsigned int issue_flags)
+{
+	struct io_recvzc *zc = io_kiocb_to_cmd(req, struct io_recvzc);
+	struct msghdr msg;
+	struct socket *sock;
+	struct iovec iov;
+	unsigned int cflags;
+	unsigned flags;
+	int ret, min_ret = 0;
+	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
+	size_t len = zc->sr.len;
+
+	if (!(req->flags & REQ_F_POLLED) &&
+	    (zc->sr.flags & IORING_RECVSEND_POLL_FIRST))
+		return -EAGAIN;
+
+	sock = sock_from_file(req->file);
+	if (unlikely(!sock))
+		return -ENOTSOCK;
+
+retry_multishot:
+	if (io_do_buffer_select(req)) {
+		void __user *buf;
+
+		buf = io_buffer_select(req, &len, issue_flags);
+		if (!buf)
+			return -ENOBUFS;
+		zc->sr.buf = buf;
+	}
+
+	ret = import_single_range(READ, zc->sr.buf, len, &iov, &msg.msg_iter);
+	if (unlikely(ret))
+		goto out_free;
+
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_control = NULL;
+	msg.msg_get_inq = 1;
+	msg.msg_flags = 0;
+	msg.msg_controllen = 0;
+	msg.msg_iocb = NULL;
+	msg.msg_ubuf = NULL;
+
+	flags = zc->sr.msg_flags;
+	if (force_nonblock)
+		flags |= MSG_DONTWAIT;
+	if (flags & MSG_WAITALL)
+		min_ret = iov_iter_count(&msg.msg_iter);
+
+	ret = io_zctap_recv(zc->ifq, sock, &msg, flags, zc->datalen,
+			    zc->copy_bgid);
+	if (ret < min_ret) {
+		if (ret == -EAGAIN && force_nonblock) {
+			if ((req->flags & IO_APOLL_MULTI_POLLED) == IO_APOLL_MULTI_POLLED) {
+				io_kbuf_recycle(req, issue_flags);
+				return IOU_ISSUE_SKIP_COMPLETE;
+			}
+
+			return -EAGAIN;
+		}
+		if (ret == -ERESTARTSYS)
+			ret = -EINTR;
+		if (ret > 0 && io_net_retry(sock, flags)) {
+			zc->sr.len -= ret;
+			zc->sr.buf += ret;
+			zc->sr.done_io += ret;
+			req->flags |= REQ_F_PARTIAL_IO;
+			return -EAGAIN;
+		}
+		req_set_fail(req);
+	} else if ((flags & MSG_WAITALL) && (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+out_free:
+		req_set_fail(req);
+	}
+
+	if (ret > 0)
+		ret += zc->sr.done_io;
+	else if (zc->sr.done_io)
+		ret = zc->sr.done_io;
 	else
 		io_kbuf_recycle(req, issue_flags);
 

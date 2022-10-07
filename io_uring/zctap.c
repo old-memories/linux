@@ -7,6 +7,7 @@
 #include <linux/io_uring.h>
 #include <linux/netdevice.h>
 #include <linux/nospec.h>
+#include <net/tcp.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -392,4 +393,357 @@ bool io_zctap_ifq_put_page(struct io_zctap_ifq *ifq, struct page *page)
 	ifr->page[ifr->count++] = page;
 
 	return true;
+}
+
+static inline bool
+zctap_skb_ours(struct sk_buff *skb)
+{
+	return skb->pp_recycle;
+}
+
+struct zctap_read_desc {
+	struct iov_iter *iter;
+	struct ifq_region *ifr;
+	u32 iov_space;
+	u32 iov_limit;
+	u32 recv_limit;
+
+	struct io_kiocb req;
+	u8 *buf;
+	size_t offset;
+	size_t buflen;
+
+	struct io_zctap_ifq *ifq;
+	u16 ifq_id;
+	u16 copy_bgid;			/* XXX move to register ifq? */
+};
+
+static int __zctap_get_user_buffer(struct zctap_read_desc *ztr, int len)
+{
+	if (!ztr->buflen) {
+		ztr->req = (struct io_kiocb) {
+			.ctx = ztr->ifq->ctx,
+			.buf_index = ztr->copy_bgid,
+		};
+
+		ztr->buf = (u8 *)io_zctap_buffer(&ztr->req, &ztr->buflen);
+		ztr->offset = 0;
+	}
+	return len > ztr->buflen ? ztr->buflen : len;
+}
+
+static int zctap_copy_data(struct zctap_read_desc *ztr, int len, u8 *kaddr)
+{
+	struct io_uring_zctap_iov zov;
+	u32 space;
+	int err;
+
+	space = ztr->iov_space + sizeof(zov);
+	if (space > ztr->iov_limit)
+		return 0;
+
+	len = __zctap_get_user_buffer(ztr, len);
+	if (!len)
+		return -ENOBUFS;
+
+	err = copy_to_user(ztr->buf + ztr->offset, kaddr, len);
+	if (err)
+		return -EFAULT;
+
+	zov = (struct io_uring_zctap_iov) {
+		.off = ztr->offset,
+		.len = len,
+		.bgid = ztr->copy_bgid,
+		.bid = ztr->req.buf_index,
+		.ifq_id = ztr->ifq_id,
+	};
+
+	if (copy_to_iter(&zov, sizeof(zov), ztr->iter) != sizeof(zov))
+		return -EFAULT;
+
+	ztr->offset += len;
+	ztr->buflen -= len;
+
+	ztr->iov_space = space;
+
+	return len;
+}
+
+static int zctap_copy_frag(struct zctap_read_desc *ztr, struct page *page,
+			   int off, int len, int id,
+			   struct io_uring_zctap_iov *zov)
+{
+	u8 *kaddr;
+	int err;
+
+	len = __zctap_get_user_buffer(ztr, len);
+	if (!len)
+		return -ENOBUFS;
+
+	if (id == 0) {
+		kaddr = kmap(page) + off;
+		err = copy_to_user(ztr->buf + ztr->offset, kaddr, len);
+		kunmap(page);
+	} else {
+		kaddr = page_address(page) + off;
+		err = copy_to_user(ztr->buf + ztr->offset, kaddr, len);
+	}
+
+	if (err)
+		return -EFAULT;
+
+	*zov = (struct io_uring_zctap_iov) {
+		.off = ztr->offset,
+		.len = len,
+		.bgid = ztr->copy_bgid,
+		.bid = ztr->req.buf_index,
+		.ifq_id = ztr->ifq_id,
+	};
+
+	ztr->offset += len;
+	ztr->buflen -= len;
+
+	return len;
+}
+
+static int zctap_recv_frag(struct zctap_read_desc *ztr,
+			   const skb_frag_t *frag, int off, int len)
+{
+	struct io_uring_zctap_iov zov;
+	struct page *page;
+	int id, pgid;
+	u32 space;
+
+	space = ztr->iov_space + sizeof(zov);
+	if (space > ztr->iov_limit)
+		return 0;
+
+	page = skb_frag_page(frag);
+	id = zctap_page_ifq_id(page);
+	off += skb_frag_off(frag);
+
+	if (likely(id == ztr->ifq_id)) {
+		pgid = zctap_page_id(page);
+		io_add_page_uref(ztr->ifr, pgid);
+		zov = (struct io_uring_zctap_iov) {
+			.off = off,
+			.len = len,
+			.bgid = zctap_page_region_id(page),
+			.bid = pgid,
+			.ifq_id = id,
+		};
+	} else {
+		len = zctap_copy_frag(ztr, page, off, len, id, &zov);
+		if (len <= 0)
+			return len;
+	}
+
+	if (copy_to_iter(&zov, sizeof(zov), ztr->iter) != sizeof(zov))
+		return -EFAULT;
+
+	ztr->iov_space = space;
+
+	return len;
+}
+
+/* Our version of __skb_datagram_iter  -- should work for UDP also. */
+static int
+zctap_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
+	       unsigned int offset, size_t len)
+{
+	struct zctap_read_desc *ztr = desc->arg.data;
+	unsigned start, start_off;
+	struct sk_buff *frag_iter;
+	int i, copy, end, ret = 0;
+
+	if (ztr->iov_space >= ztr->iov_limit) {
+		desc->count = 0;
+		return 0;
+	}
+	if (len > ztr->recv_limit)
+		len = ztr->recv_limit;
+
+	start = skb_headlen(skb);
+	start_off = offset;
+
+	if (offset < start) {
+		copy = start - offset;
+		if (copy > len)
+			copy = len;
+
+		/* copy out linear data */
+		ret = zctap_copy_data(ztr, copy, skb->data + offset);
+		if (ret < 0)
+			goto out;
+		offset += ret;
+		len -= ret;
+		if (len == 0 || ret != copy)
+			goto out;
+	}
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag;
+
+		WARN_ON(start > offset + len);
+
+		frag = &skb_shinfo(skb)->frags[i];
+		end = start + skb_frag_size(frag);
+
+		if (offset < end) {
+			copy = end - offset;
+			if (copy > len)
+				copy = len;
+
+			ret = zctap_recv_frag(ztr, frag, offset - start, copy);
+			if (ret < 0)
+				goto out;
+
+			offset += ret;
+			len -= ret;
+			if (len == 0 || ret != copy)
+				goto out;
+		}
+		start = end;
+	}
+
+	skb_walk_frags(skb, frag_iter) {
+		WARN_ON(start > offset + len);
+
+		end = start + frag_iter->len;
+		if (offset < end) {
+			int off;
+
+			copy = end - offset;
+			if (copy > len)
+				copy = len;
+
+			off = offset - start;
+			ret = zctap_recv_skb(desc, frag_iter, off, copy);
+			if (ret < 0)
+				goto out;
+
+			offset += ret;
+			len -= ret;
+			if (len == 0 || ret != copy)
+				goto out;
+		}
+		start = end;
+	}
+
+out:
+	if (offset == start_off)
+		return ret;
+	return offset - start_off;
+}
+
+static int __io_zctap_tcp_read(struct sock *sk, struct zctap_read_desc *zrd)
+{
+	read_descriptor_t rd_desc = {
+		.arg.data = zrd,
+		.count = 1,
+	};
+
+	return tcp_read_sock(sk, &rd_desc, zctap_recv_skb);
+}
+
+static int io_zctap_tcp_recvmsg(struct sock *sk, struct zctap_read_desc *zrd,
+				int flags, int *addr_len)
+{
+	size_t used;
+	long timeo;
+	int ret;
+
+	ret = used = 0;
+
+	lock_sock(sk);
+
+	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+	while (zrd->recv_limit) {
+		ret = __io_zctap_tcp_read(sk, zrd);
+		if (ret < 0)
+			break;
+		if (!ret) {
+			if (used)
+				break;
+			if (sock_flag(sk, SOCK_DONE))
+				break;
+			if (sk->sk_err) {
+				ret = sock_error(sk);
+				break;
+			}
+			if (sk->sk_shutdown & RCV_SHUTDOWN)
+				break;
+			if (sk->sk_state == TCP_CLOSE) {
+				ret = -ENOTCONN;
+				break;
+			}
+			if (!timeo) {
+				ret = -EAGAIN;
+				break;
+			}
+			if (!skb_queue_empty(&sk->sk_receive_queue))
+				break;
+			sk_wait_data(sk, &timeo, NULL);
+			if (signal_pending(current)) {
+				ret = sock_intr_errno(timeo);
+				break;
+			}
+			continue;
+		}
+		zrd->recv_limit -= ret;
+		used += ret;
+
+		if (!timeo)
+			break;
+		release_sock(sk);
+		lock_sock(sk);
+
+		if (sk->sk_err || sk->sk_state == TCP_CLOSE ||
+		    (sk->sk_shutdown & RCV_SHUTDOWN) ||
+		    signal_pending(current))
+			break;
+	}
+
+	release_sock(sk);
+
+	/* XXX, handle timestamping */
+
+	if (used)
+		return used;
+
+	return ret;
+}
+
+int io_zctap_recv(struct io_zctap_ifq *ifq, struct socket *sock,
+		  struct msghdr *msg, int flags, u32 datalen, u16 copy_bgid)
+{
+	struct sock *sk = sock->sk;
+	struct zctap_read_desc zrd = {
+		.iov_limit = msg_data_left(msg),
+		.recv_limit = datalen,
+		.iter = &msg->msg_iter,
+		.ifq = ifq,
+		.ifq_id = ifq->id,
+		.copy_bgid = copy_bgid,
+		.ifr = ifq->region,
+	};
+	const struct proto *prot;
+	int addr_len = 0;
+	int ret;
+
+	if (flags & MSG_ERRQUEUE)
+		return -EOPNOTSUPP;
+
+	prot = READ_ONCE(sk->sk_prot);
+	if (prot->recvmsg != tcp_recvmsg)
+		return -EPROTONOSUPPORT;
+
+	sock_rps_record_flow(sk);
+
+	ret = io_zctap_tcp_recvmsg(sk, &zrd, flags, &addr_len);
+	if (ret >= 0) {
+		msg->msg_namelen = addr_len;
+		ret = zrd.iov_space;
+	}
+	return ret;
 }

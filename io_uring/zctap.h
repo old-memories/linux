@@ -12,4 +12,9 @@ int io_provide_ifq_region_prep(struct io_kiocb *req,
                                const struct io_uring_sqe *sqe);
 int io_provide_ifq_region(struct io_kiocb *req, unsigned int issue_flags);
 
+int io_recvzc(struct io_kiocb *req, unsigned int issue_flags);
+int io_recvzc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+int io_zctap_recv(struct io_zctap_ifq *ifq, struct socket *sock,
+		  struct msghdr *msg, int flags, u32 datalen, u16 copy_bgid);
+
 #endif

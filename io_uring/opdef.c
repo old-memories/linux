@@ -497,6 +497,20 @@ const struct io_op_def io_op_defs[] = {
 		.prep			= io_provide_ifq_region_prep,
 		.issue			= io_provide_ifq_region,
 	},
+	[IORING_OP_RECV_ZC] = {
+		.name			= "RECV_ZC",
+		.needs_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollin			= 1,
+		.buffer_select		= 1,
+		.ioprio			= 1,
+#if defined(CONFIG_NET)
+		.prep			= io_recvzc_prep,
+		.issue			= io_recvzc,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
 };
 
 const char *io_uring_get_opcode(u8 opcode)
