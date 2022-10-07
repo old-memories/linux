@@ -50,6 +50,8 @@ unsigned int __io_put_kbuf(struct io_kiocb *req, unsigned issue_flags);
 
 void io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags);
 
+u64 io_zctap_buffer(struct io_kiocb *req, size_t *len);
+
 static inline void io_kbuf_recycle_ring(struct io_kiocb *req)
 {
 	/*

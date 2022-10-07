@@ -37,6 +37,14 @@ void __io_uring_free(struct task_struct *tsk);
 void io_uring_unreg_ringfd(void);
 const char *io_uring_get_opcode(u8 opcode);
 
+struct io_zctap_ifq;
+struct page *io_zctap_ifq_get_page(struct io_zctap_ifq *ifq,
+                                   unsigned int order);
+unsigned long io_zctap_ifq_get_bulk(struct io_zctap_ifq *ifq,
+                                    unsigned long nr_pages,
+                                    struct page **page_array);
+bool io_zctap_ifq_put_page(struct io_zctap_ifq *ifq, struct page *page);
+
 static inline void io_uring_files_cancel(void)
 {
 	if (current->io_uring) {
@@ -80,6 +88,22 @@ static inline const char *io_uring_get_opcode(u8 opcode)
 {
 	return "";
 }
+static inline struct page *io_zctap_ifq_get_page(struct io_zctap_ifq *ifq,
+                                   unsigned int order)
+{
+	return NULL;
+}
+sttaic unsigned long io_zctap_ifq_get_bulk(struct io_zctap_ifq *ifq,
+                                    unsigned long nr_pages,
+                                    struct page **page_array)
+{
+	return 0;
+}
+bool io_zctap_ifq_put_page(struct io_zctap_ifq *ifq, struct page *page)
+{
+	return false;
+}
+
 #endif
 
 #endif

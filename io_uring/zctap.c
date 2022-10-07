@@ -311,3 +311,85 @@ out:
 
 	return -EEXIST;
 }
+
+/* gets a user-supplied buffer from the fill queue */
+static struct page *io_zctap_get_buffer(struct io_zctap_ifq *ifq)
+{
+	struct io_kiocb req = {
+		.ctx = ifq->ctx,
+		.buf_index = ifq->fill_bgid,
+	};
+	struct io_mapped_ubuf *imu;
+	struct ifq_region *ifr;
+	size_t len;
+	u64 addr;
+	int idx;
+
+	len = 0;
+	ifr = ifq->region;
+	imu = ifr->imu;
+
+	addr = io_zctap_buffer(&req, &len);
+	if (!addr)
+		goto fail;
+
+	/* XXX poor man's implementation of io_import_fixed */
+
+	if (addr < ifr->start || addr + len > ifr->end)
+		goto fail;
+
+	idx = (addr - ifr->start) >> PAGE_SHIFT;
+
+	return imu->bvec[ifr->imu_idx + idx].bv_page;
+
+fail:
+	/* warn and just drop buffer */
+	WARN_RATELIMIT(1, "buffer addr %llx invalid", addr);
+	return NULL;
+}
+
+struct page *io_zctap_ifq_get_page(struct io_zctap_ifq *ifq,
+				   unsigned int order)
+{
+	struct ifq_region *ifr = ifq->region;
+
+	if (WARN_RATELIMIT(order != 1, "order %d", order))
+		return NULL;
+
+	if (ifr->count)
+		return ifr->page[--ifr->count];
+
+	return io_zctap_get_buffer(ifq);
+}
+
+unsigned long io_zctap_ifq_get_bulk(struct io_zctap_ifq *ifq,
+				    unsigned long nr_pages,
+				    struct page **page_array)
+{
+	struct ifq_region *ifr = ifq->region;
+	int count;
+
+	count = min_t(unsigned long, nr_pages, ifr->count);
+	if (count) {
+		ifr->count -= count;
+		memcpy(page_array, &ifr->page[ifr->count],
+		       count * sizeof(struct page *));
+	}
+
+	return count;
+}
+
+bool io_zctap_ifq_put_page(struct io_zctap_ifq *ifq, struct page *page)
+{
+	struct ifq_region *ifr = ifq->region;
+
+	/* if page is not usermapped, then throw an error */
+
+	/* sanity check - leak pages here if hit */
+	if (WARN_RATELIMIT(ifr->count >= ifr->nr_pages, "page overflow"))
+		return true;
+
+	ifr->page[ifr->count++] = page;
+
+	return true;
+}

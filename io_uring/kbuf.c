@@ -188,6 +188,19 @@ void __user *io_buffer_select(struct io_kiocb *req, size_t *len,
 	return ret;
 }
 
+/* XXX May called from the driver, in napi context. */
+u64 io_zctap_buffer(struct io_kiocb *req, size_t *len)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	struct io_buffer_list *bl;
+	void __user *ret = NULL;
+
+	bl = io_buffer_get_list(ctx, req->buf_index);
+	if (likely(bl))
+		ret = io_ring_buffer_select(req, len, bl, IO_URING_F_UNLOCKED);
+	return (u64)ret;
+}
+
 static __cold int io_init_bl_list(struct io_ring_ctx *ctx)
 {
 	int i;
